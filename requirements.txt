@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+motor
+pydantic
+requests
+beautifulsoup4
+lxml
+sentence-transformers
+torch
+numpy
+apscheduler
+langchain
+openai
+python-dotenv
