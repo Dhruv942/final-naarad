@@ -7,3 +7,6 @@ db = client.stagin_local
 users_collection = db.get_collection("users")
 notifications_collection = db.get_collection("notifications")
 alerts_collection = db.get_collection("alerts")
+news_collection = db.get_collection("news")
+feed_collection = db.get_collection("feeds")
+personalized_collection = db.get_collection("personalized_news")

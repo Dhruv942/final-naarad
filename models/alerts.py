@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import List, Optional
 from pydantic import BaseModel, Field
-from bson import ObjectId
+import uuid
 
 
 class CategoryType(str, Enum):
@@ -17,6 +17,12 @@ class AlertBase(BaseModel):
     sub_categories: Optional[List[str]] = Field(
         default=None, description="Frontend selected sub-categories"
     )
+    followup_questions: Optional[List[str]] = Field(
+        default=None, description="Follow-up questions from frontend"
+    )
+    custom_question: Optional[str] = Field(
+        default=None, description="Custom question text from frontend"
+    )
 
 
 class AlertCreate(AlertBase):
@@ -24,11 +30,10 @@ class AlertCreate(AlertBase):
 
 
 class AlertResponse(AlertBase):
-    id: str = Field(..., alias="_id")
+    alert_id: str
     user_id: str
     is_active: bool
 
     class Config:
         use_enum_values = True
         populate_by_name = True
-        json_encoders = {ObjectId: str}

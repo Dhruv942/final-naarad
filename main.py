@@ -18,9 +18,11 @@ app.add_middleware(
 from routes import user_routes 
 from routes import notification_prefernces
 from routes import alerts
+from controllers import news
 app.include_router(user_routes.router, prefix="/auth", tags=["Authentication"])
 app.include_router(notification_prefernces.router, prefix="/preferences", tags=["Notification Preferences"])
 app.include_router(alerts.router, prefix="/alerts", tags=["Alerts"])
+app.include_router(news.router, prefix="/news", tags=["News"])
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "message": "News App API is running"}
