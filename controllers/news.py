@@ -34,7 +34,7 @@ app = FastAPI()
 router = APIRouter()
 
 # -------------------- Gemini LLM Gatekeeper --------------------
-GEMINI_API_KEY = 'AIzaSyCpPZ2xRGJGx06tZFw_XfU_RTsBiIF_afg'
+GEMINI_API_KEY = 'AIzaSyCpPZ2xRGJGx06tZFw_XfU_RTsBiIF_afg'  # Gemini API key
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
 async def gemini_gatekeeper(news_title: str, news_description: str, user_query: str):
@@ -42,7 +42,7 @@ async def gemini_gatekeeper(news_title: str, news_description: str, user_query: 
     Ask Gemini: Is this news relevant for the user's alert/query?
     Returns: (is_relevant: bool, summary: str)
     """
-    prompt_text = f"""
+    prompt = f"""
 User Query: {user_query}
 News Title: {news_title}
 News Description: {news_description}
@@ -50,26 +50,18 @@ News Description: {news_description}
 Is this news relevant to the user query? Answer YES or NO and provide a 1-sentence summary if YES.
 """
 
-    request_body = {
-        "instances": [
-            {"input_text": prompt_text}
-        ],
-        "parameters": {
-            "max_output_tokens": 150
-        }
-    }
-
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 GEMINI_ENDPOINT,
-                headers={"X-Goog-Api-Key": GEMINI_API_KEY},
-                json=request_body
+                headers={"X-Goog-Api-Key": GEMINI_API_KEY},  # <-- correct header
+                json={"prompt": prompt, "max_output_tokens": 150}
             )
             resp.raise_for_status()
             data = resp.json()
             
-            # Gemini response structure
+            # Google Gemini API usually returns something like:
+            # {"candidates":[{"content":"YES: summary text..."}, ...]}
             candidates = data.get("candidates", [])
             if candidates:
                 text = candidates[0].get("content", "").strip()
@@ -80,7 +72,7 @@ Is this news relevant to the user query? Answer YES or NO and provide a 1-senten
 
     except Exception as e:
         logger.error(f"Gemini gatekeeper error: {e}")
-        # fallback to HF summarizer
+        # fallback to Hugging Face summarizer if Gemini fails
         try:
             summary = summarizer(news_description, max_length=60, min_length=20, do_sample=False)[0]['summary_text']
         except:
