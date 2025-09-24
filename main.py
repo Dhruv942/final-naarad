@@ -1,16 +1,47 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import logging
+import asyncio
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from contextlib import asynccontextmanager
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Scheduler instance
+scheduler = AsyncIOScheduler()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Import here to avoid circular imports
+    from controllers.news import process_scheduled_alerts
+
+    # Add job to run every 2 minutes
+    scheduler.add_job(
+        process_scheduled_alerts,
+        'interval',
+        minutes=1,
+        id='alert_processing',
+        replace_existing=True
+    )
+
+    # Start scheduler
+    scheduler.start()
+    logger.info("Started automatic alert processing scheduler (every 2 minutes)")
+
+    yield
+
+    # Shutdown
+    scheduler.shutdown()
+    logger.info("Stopped alert processing scheduler")
+
 # FastAPI App
 app = FastAPI(
     title="Naarad App API",
     description="Personalized news aggregation API",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # CORS Middleware
