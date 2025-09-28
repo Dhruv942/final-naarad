@@ -14,3 +14,7 @@ openai
 python-dotenv
 feedparser
 httpx
+pymongo
+scikit-learn
+transformers
+datasets

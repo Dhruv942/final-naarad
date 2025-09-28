@@ -1,40 +1,21 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import logging
-import asyncio
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from contextlib import asynccontextmanager
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Scheduler instance
-scheduler = AsyncIOScheduler()
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Import here to avoid circular imports
-    from controllers.news import process_scheduled_alerts
-
-    # Add job to run every 2 minutes
-    scheduler.add_job(
-        process_scheduled_alerts,
-        'interval',
-        minutes=1,
-        id='alert_processing',
-        replace_existing=True
-    )
-
-    # Start scheduler
-    scheduler.start()
-    logger.info("Started automatic alert processing scheduler (every 2 minutes)")
+    # RAG system startup - no more old ML models
+    logger.info("🚀 Starting Naarad with RAG Intelligence System")
 
     yield
 
     # Shutdown
-    scheduler.shutdown()
-    logger.info("Stopped alert processing scheduler")
+    logger.info("🛑 Shutting down Naarad RAG system")
 
 # FastAPI App
 app = FastAPI(
@@ -57,13 +38,14 @@ app.add_middleware(
 from routes import user_routes
 from routes import notification_prefernces
 from routes import alerts
-from controllers import news
 from controllers import gatekeeper
+from controllers import rag_news_controller  # 👈 RAG controller
+
 # Routers
 app.include_router(user_routes.router, prefix="/auth", tags=["Authentication"])
 app.include_router(notification_prefernces.router, prefix="/preferences", tags=["Notification Preferences"])
 app.include_router(alerts.router, prefix="/alerts", tags=["Alerts"])
-app.include_router(news.router, prefix="/news", tags=["News Cron"])  # 👈 cron wala router
+app.include_router(rag_news_controller.router, prefix="/rag", tags=["RAG News Intelligence"])  # 👈 RAG system
 app.include_router(gatekeeper.router, prefix="/gatekeeper", tags=["Gatekeeper"])
 
 
