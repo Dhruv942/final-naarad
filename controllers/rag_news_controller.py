@@ -65,6 +65,33 @@ async def fetch_rss_feed(url: str) -> List[Dict[str, Any]]:
                 articles = []
 
                 for entry in feed.entries[:20]:  # Limit to 20 articles per feed
+                    # Extract image from RSS feed
+                    image_url = ''
+
+                    # Check multiple possible image sources in RSS
+                    if hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
+                        image_url = entry.media_thumbnail[0]['url']
+                    elif hasattr(entry, 'media_content') and entry.media_content:
+                        image_url = entry.media_content[0]['url']
+                    elif hasattr(entry, 'enclosures') and entry.enclosures:
+                        for enclosure in entry.enclosures:
+                            if enclosure.type and 'image' in enclosure.type:
+                                image_url = enclosure.href
+                                break
+                    elif hasattr(entry, 'links'):
+                        for link in entry.links:
+                            if link.get('type', '').startswith('image/'):
+                                image_url = link.href
+                                break
+
+                    # Extract from description/summary if image tag exists
+                    if not image_url:
+                        import re
+                        description_text = getattr(entry, 'description', '') + getattr(entry, 'summary', '')
+                        img_match = re.search(r'<img[^>]+src="([^"]+)"', description_text)
+                        if img_match:
+                            image_url = img_match.group(1)
+
                     article = {
                         'title': getattr(entry, 'title', ''),
                         'url': getattr(entry, 'link', ''),
@@ -74,6 +101,7 @@ async def fetch_rss_feed(url: str) -> List[Dict[str, Any]]:
                         'author': getattr(entry, 'author', ''),
                         'source': feed.feed.get('title', 'Unknown'),
                         'tags': [tag.term for tag in getattr(entry, 'tags', [])],
+                        'image_url': image_url,
                     }
                     articles.append(article)
 
@@ -182,7 +210,10 @@ async def get_user_news(user_id: str):
         if all_relevant_news:
             all_relevant_news = await final_gemini_perfect_filter(all_relevant_news, user_alerts, 3)
 
-        # Step 8: Learn from user alert patterns and update profile
+        # Step 8: Final satisfaction debug check
+        satisfaction_report = await debug_user_satisfaction(all_relevant_news, user_alerts)
+
+        # Step 9: Learn from user alert patterns and update profile
         await update_user_profile_from_alerts(user_id, user_alerts, all_relevant_news)
 
         return {
@@ -191,6 +222,7 @@ async def get_user_news(user_id: str):
             "alerts_processed": len(user_alerts),
             "total_articles": len(all_relevant_news),
             "articles": all_relevant_news,
+            "satisfaction_debug": satisfaction_report,
             "timestamp": datetime.now()
         }
 
@@ -508,33 +540,45 @@ async def final_gemini_perfect_filter(articles: list, user_alerts: list, target_
             }
             articles_for_analysis.append(article_data)
 
-        # Create perfect filtering prompt
+        # Create comprehensive intelligent prompt that does everything in one call
         perfect_prompt = f"""
-        You are an expert news curator. Select ONLY the {target_count} most relevant and valuable articles for this user.
+        You are an expert news curator. Analyze user requirements and select ONLY the {target_count} most satisfying articles.
 
-        User Requirements:
-        - Category: {user_context.get('category', '')}
-        - Keywords: {user_context.get('keywords', [])}
+        USER PROFILE ANALYSIS:
+        - Main Category: {user_context.get('category', '')}
+        - Sub-Categories/Keywords: {user_context.get('keywords', [])}
         - Follow-up Questions: {user_context.get('followup_questions', [])}
         - Custom Question: {user_context.get('custom_question', '')}
-        - Intent: {user_context.get('intent', '')}
+        - User Intent: {user_context.get('intent', '')}
 
-        Available Articles:
+        AVAILABLE ARTICLES:
         {json.dumps(articles_for_analysis, indent=2)}
 
-        Instructions:
-        1. Select ONLY {target_count} articles that PERFECTLY match the user's intent
-        2. Prioritize articles that are most relevant, recent, and valuable
-        3. Avoid duplicate or similar content
-        4. Focus on quality over quantity
+        TASK: Select {target_count} articles that will make the user happy and satisfied. For each selected article, provide:
+        1. Enhanced title (engaging, clickable)
+        2. Short description (2-3 lines that hook the user)
+        3. Satisfaction reason (why user will love this)
 
-        Respond with JSON array of selected article IDs and reasons:
+        Note: Images will be taken directly from RSS feeds, no need to suggest images.
+
+        SELECTION CRITERIA:
+        ✅ Perfectly matches main category + sub-categories
+        ✅ Addresses follow-up questions and custom questions
+        ✅ Recent and valuable content
+        ✅ Will genuinely interest and satisfy the user
+        ✅ No duplicate or similar content
+
+        RESPOND WITH JSON:
         [
-            {{"article_id": 0, "reason": "Perfect match because..."}},
-            {{"article_id": 3, "reason": "Highly relevant because..."}}
+            {{
+                "article_id": 0,
+                "enhanced_title": "Engaging title that makes user want to click",
+                "short_description": "2-3 lines that perfectly explain why this news matters to the user and hooks their interest",
+                "satisfaction_reason": "Specific reason why this article perfectly satisfies user's intent and will make them happy"
+            }}
         ]
 
-        Select maximum {target_count} articles only!
+        Select maximum {target_count} articles that will truly satisfy the user!
         """
 
         # Call Gemini for perfect filtering
@@ -564,16 +608,25 @@ async def final_gemini_perfect_filter(articles: list, user_alerts: list, target_
                     if json_match:
                         perfect_results = json.loads(json_match.group())
 
-                        # Get selected articles
+                        # Get enhanced articles with all the intelligent additions
                         perfect_articles = []
                         for selection in perfect_results:
                             article_idx = selection.get('article_id')
-                            reason = selection.get('reason', '')
+                            enhanced_title = selection.get('enhanced_title', '')
+                            short_description = selection.get('short_description', '')
+                            satisfaction_reason = selection.get('satisfaction_reason', '')
 
                             if 0 <= article_idx < len(articles):
                                 selected_article = articles[article_idx]
-                                selected_article['gemini_selection_reason'] = reason
+
+                                # Add intelligent enhancements (image comes from RSS)
+                                selected_article['enhanced_title'] = enhanced_title
+                                selected_article['short_description'] = short_description
+                                selected_article['satisfaction_reason'] = satisfaction_reason
                                 selected_article['perfect_match'] = True
+                                selected_article['user_satisfaction_score'] = 10  # Perfect match
+                                # image_url already exists from RSS extraction
+
                                 perfect_articles.append(selected_article)
 
                         logger.info(f"Gemini perfect filter: {len(articles)} -> {len(perfect_articles)} articles")
@@ -593,6 +646,103 @@ async def final_gemini_perfect_filter(articles: list, user_alerts: list, target_
     except Exception as e:
         logger.error(f"Error in perfect filtering: {e}")
         return articles[:target_count]
+
+async def debug_user_satisfaction(articles: list, user_alerts: list) -> dict:
+    """Debug function to check if articles will satisfy user requirements"""
+    try:
+        if not articles or not user_alerts:
+            return {"status": "no_data", "message": "No articles or alerts to check"}
+
+        # Get user requirements
+        user_requirements = {}
+        for alert in user_alerts:
+            user_requirements = {
+                'main_category': alert.get('main_category', '').lower(),
+                'keywords': [k.lower() for k in alert.get('sub_categories', [])],
+                'followup_questions': [q.lower() for q in alert.get('followup_questions', [])],
+                'custom_question': alert.get('custom_question', '').lower()
+            }
+
+        # Analyze each article
+        satisfaction_analysis = []
+        overall_satisfaction = 0
+
+        for idx, article in enumerate(articles):
+            title = article.get('title', '').lower()
+            content = (article.get('content', '') + ' ' + article.get('summary', '')).lower()
+
+            # Check satisfaction criteria
+            matches = {
+                'category_match': False,
+                'keyword_match': False,
+                'followup_match': False,
+                'custom_match': False
+            }
+
+            # Category check
+            if user_requirements['main_category'] == 'sports' and article.get('category', '').lower() == 'sports':
+                matches['category_match'] = True
+
+            # Keywords check
+            if user_requirements['keywords']:
+                for keyword in user_requirements['keywords']:
+                    if keyword in title or keyword in content:
+                        matches['keyword_match'] = True
+                        break
+
+            # Followup questions check
+            if user_requirements['followup_questions']:
+                for question in user_requirements['followup_questions']:
+                    if question in title or question in content:
+                        matches['followup_match'] = True
+                        break
+
+            # Custom question check
+            if user_requirements['custom_question']:
+                custom_words = user_requirements['custom_question'].split()
+                if any(word in title or word in content for word in custom_words if len(word) > 3):
+                    matches['custom_match'] = True
+
+            # Calculate satisfaction score
+            score = sum(matches.values()) / len(matches) * 100
+            overall_satisfaction += score
+
+            satisfaction_analysis.append({
+                'article_id': idx,
+                'title': article.get('title', '')[:50] + '...',
+                'satisfaction_score': round(score, 1),
+                'matches': matches,
+                'has_image': bool(article.get('image_url', '')),
+                'relevance_score': article.get('relevance_score', 0)
+            })
+
+        overall_satisfaction = overall_satisfaction / len(articles) if articles else 0
+
+        # Determine satisfaction level
+        if overall_satisfaction >= 75:
+            satisfaction_level = "EXCELLENT - User will be very satisfied"
+        elif overall_satisfaction >= 50:
+            satisfaction_level = "GOOD - User will be satisfied"
+        elif overall_satisfaction >= 25:
+            satisfaction_level = "FAIR - User might be satisfied"
+        else:
+            satisfaction_level = "POOR - User may not be satisfied"
+
+        debug_report = {
+            'overall_satisfaction_score': round(overall_satisfaction, 1),
+            'satisfaction_level': satisfaction_level,
+            'user_requirements': user_requirements,
+            'articles_analysis': satisfaction_analysis,
+            'total_articles': len(articles),
+            'recommendation': "These articles should satisfy user intent" if overall_satisfaction >= 50 else "Consider improving article relevance"
+        }
+
+        logger.info(f"Satisfaction Debug: {overall_satisfaction:.1f}% - {satisfaction_level}")
+        return debug_report
+
+    except Exception as e:
+        logger.error(f"Error in satisfaction debug: {e}")
+        return {"status": "error", "message": str(e)}
 
 async def update_user_profile_from_alerts(user_id: str, user_alerts: list, relevant_articles: list):
     """Learn from user alert patterns and update user profile intelligently"""
