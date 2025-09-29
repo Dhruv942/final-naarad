@@ -36,27 +36,27 @@ rag_system = RAGSystem(db, GEMINI_API_KEY)
 router = APIRouter()
 
 # =============================================================================
-# 1-MINUTE CRON JOB FOR AUTOMATED NEWS ALERTS WITH USER PREFERENCES
+# 5-MINUTE CRON JOB FOR AUTOMATED NEWS ALERTS WITH USER PREFERENCES
 # =============================================================================
 
 class NewsAlertScheduler:
-    """1-minute scheduler for automated news alerts"""
+    """5-minute scheduler for automated news alerts"""
 
     def __init__(self):
         self.running = False
 
     async def start_scheduler(self):
-        """Start the 1-minute scheduler"""
+        """Start the 5-minute scheduler"""
         self.running = True
-        logger.info("🔔 News Alert Scheduler started (1-minute interval)")
+        logger.info("🔔 News Alert Scheduler started (5-minute interval)")
 
         while self.running:
             try:
                 await self.process_automated_alerts()
-                await asyncio.sleep(60)  # 1 minute
+                await asyncio.sleep(300)  # 5 minutes
             except Exception as e:
                 logger.error(f"Error in scheduler: {e}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(300)
 
     def stop_scheduler(self):
         """Stop the scheduler"""
