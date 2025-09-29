@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 
 # Logging setup
@@ -12,10 +13,23 @@ async def lifespan(app: FastAPI):
     # RAG system startup - no more old ML models
     logger.info("🚀 Starting Naarad with RAG Intelligence System")
 
+    # Start the news alert scheduler in background
+    from controllers.rag_news_controller import start_news_scheduler
+    scheduler_task = asyncio.create_task(start_news_scheduler())
+    logger.info("📅 News Alert Scheduler started in background")
+
     yield
 
     # Shutdown
     logger.info("🛑 Shutting down Naarad RAG system")
+    from controllers.rag_news_controller import stop_news_scheduler
+    stop_news_scheduler()
+    scheduler_task.cancel()
+    try:
+        await scheduler_task
+    except asyncio.CancelledError:
+        pass
+    logger.info("📅 News Alert Scheduler stopped")
 
 # FastAPI App
 app = FastAPI(

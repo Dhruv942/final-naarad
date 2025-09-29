@@ -12,6 +12,7 @@ import re
 from datetime import datetime, timezone
 import feedparser
 import httpx
+import pytz
 
 from core.rag_system import RAGSystem
 from db.mongo import db  # Use existing MongoDB connection
@@ -22,11 +23,152 @@ logger = logging.getLogger(__name__)
 # API Configuration
 GEMINI_API_KEY = 'AIzaSyCpPZ2xRGJGx06tZFw_XfU_RTsBiIF_afg'
 
+# WATI WhatsApp Configuration
+WATI_ACCESS_TOKEN = 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJiZGVmNjQ0OS02NDU3LTRiNDYtOTM4Mi03YjNiYmRmMmY2NGIiLCJ1bmlxdWVfbmFtZSI6ImFjdHVhbGx5dXNlZnVsZXh0ZW5zaW9uc0BnbWFpbC5jb20iLCJuYW1laWQiOiJhY3R1YWxseXVzZWZ1bGV4dGVuc2lvbnNAZ21haWwuY29tIiwiZW1haWwiOiJhY3R1YWxseXVzZWZ1bGV4dGVuc2lvbnNAZ21haWwuY29tIiwiYXV0aF90aW1lIjoiMDkvMjgvMjAyNSAxMjowNzo1OCIsInRlbmFudF9pZCI6IjQ1ODkxMyIsImRiX25hbWUiOiJtdC1wcm9kLVRlbmFudHMiLCJodHRwOi8vc2NoZW1hcy5taWNyb3NvZnQuY29tL3dzLzIwMDgvMDYvaWRlbnRpdHkvY2xhaW1zL3JvbGUiOiJBRE1JTklTVFJBVE9SIiwiZXhwIjoyNTM0MDIzMDA4MDAsImlzcyI6IkNsYXJlX0FJIiwiYXVkIjoiQ2xhcmVfQUkifQ.WPoEwLq2UdUs8Rl61SklQMFQ699mj1CqQ2v7iPZunuU'
+WATI_BASE_URL = 'https://live-mt-server.wati.io/458913'
+WATI_TEMPLATE_NAME = 'sports'
+WATI_BROADCAST_NAME = 'sports_290920250931'
+
 # Initialize RAG System
 rag_system = RAGSystem(db, GEMINI_API_KEY)
 
 # FastAPI Router
 router = APIRouter()
+
+# =============================================================================
+# 1-MINUTE CRON JOB FOR AUTOMATED NEWS ALERTS WITH USER PREFERENCES
+# =============================================================================
+
+class NewsAlertScheduler:
+    """1-minute scheduler for automated news alerts"""
+
+    def __init__(self):
+        self.running = False
+
+    async def start_scheduler(self):
+        """Start the 1-minute scheduler"""
+        self.running = True
+        logger.info("🔔 News Alert Scheduler started (1-minute interval)")
+
+        while self.running:
+            try:
+                await self.process_automated_alerts()
+                await asyncio.sleep(60)  # 1 minute
+            except Exception as e:
+                logger.error(f"Error in scheduler: {e}")
+                await asyncio.sleep(60)
+
+    def stop_scheduler(self):
+        """Stop the scheduler"""
+        self.running = False
+        logger.info("🔔 News Alert Scheduler stopped")
+
+    async def check_user_preferences(self, user_id: str) -> dict:
+        """Check user notification preferences"""
+        try:
+            notifications_collection = db.get_collection("notifications")
+            user_prefs = await notifications_collection.find_one({"_id": user_id})
+
+            if user_prefs and "notification_preference" in user_prefs:
+                return user_prefs["notification_preference"]
+
+            return {"type": "real_time", "custom_time": None}
+        except Exception as e:
+            logger.error(f"Error getting preferences for {user_id}: {e}")
+            return {"type": "real_time", "custom_time": None}
+
+    async def should_send_now(self, preferences: dict) -> bool:
+        """Check if notification should be sent now"""
+        try:
+            notification_type = preferences.get("type", "real_time")
+
+            if notification_type == "real_time":
+                return True
+
+            # Get current IST time
+            ist = pytz.timezone('Asia/Kolkata')
+            now = datetime.now(ist)
+            hour, minute = now.hour, now.minute
+
+            if notification_type == "morning_digest":
+                return hour == 7 and minute <= 5
+            elif notification_type == "evening_digest":
+                return hour == 19 and minute <= 5
+            elif notification_type == "custom_time":
+                custom_time = preferences.get("custom_time")
+                if custom_time:
+                    try:
+                        custom_hour, custom_minute = map(int, custom_time.split(":"))
+                        return hour == custom_hour and abs(minute - custom_minute) <= 5
+                    except:
+                        return False
+
+            return False
+        except Exception as e:
+            logger.error(f"Error checking timing: {e}")
+            return False
+
+    async def process_automated_alerts(self):
+        """Process all active alerts with preference checks"""
+        try:
+            logger.info("⏰ Processing automated alerts...")
+
+            # Get all active alerts
+            alerts_collection = db.get_collection("alerts")
+            active_alerts = await alerts_collection.find({"is_active": True}).to_list(None)
+
+            if not active_alerts:
+                logger.info("No active alerts found")
+                return
+
+            # Process unique users
+            processed_users = set()
+            total_notifications = 0
+
+            for alert in active_alerts:
+                user_id = alert.get("user_id")
+
+                if user_id in processed_users:
+                    continue
+
+                try:
+                    # Check user preferences
+                    preferences = await self.check_user_preferences(user_id)
+
+                    if await self.should_send_now(preferences):
+                        logger.info(f"📱 Sending alerts to {user_id} ({preferences.get('type')})")
+
+                        # Call existing get_user_news function
+                        result = await get_user_news(user_id)
+
+                        if result.get("status") == "success":
+                            notifications = len(result.get("whatsapp_notifications", []))
+                            total_notifications += notifications
+                            logger.info(f"✅ Sent {notifications} notifications to {user_id}")
+                        else:
+                            logger.info(f"ℹ️ No notifications for {user_id}")
+
+                    processed_users.add(user_id)
+                    await asyncio.sleep(1)  # Rate limiting
+
+                except Exception as e:
+                    logger.error(f"Error processing {user_id}: {e}")
+
+            logger.info(f"🎯 Processed {len(processed_users)} users, sent {total_notifications} notifications")
+
+        except Exception as e:
+            logger.error(f"Error in automated alerts: {e}")
+
+# Global scheduler instance
+news_scheduler = NewsAlertScheduler()
+
+async def start_news_scheduler():
+    """Start the news scheduler"""
+    await news_scheduler.start_scheduler()
+
+def stop_news_scheduler():
+    """Stop the news scheduler"""
+    news_scheduler.stop_scheduler()
 
 # RSS Feeds Configuration
 CATEGORY_RSS_FEEDS = {
@@ -36,7 +178,7 @@ CATEGORY_RSS_FEEDS = {
         "https://rss.cnn.com/rss/edition_sport.rss"
     ],
     "news": [
-        "https://feeds.bbci.co.uk/news/rss.xml",
+        "https://www.thehindu.com/news/feeder/default.rss",
         "https://rss.cnn.com/rss/edition.rss",
         "https://feeds.reuters.com/reuters/topNews"
     ],
@@ -155,10 +297,13 @@ async def get_user_news(user_id: str):
                 "articles": []
             }
 
-        # Step 2: Process each alert and get relevant news using RAG
-        all_relevant_news = []
+        # Step 2: Process each alert separately and return individual results
+        alert_results = []
 
         for alert in user_alerts:
+            if not alert.get("is_active", True):
+                continue
+
             alert_id = alert.get("_id")
             category = alert.get("main_category", "").lower()
             keywords = alert.get("sub_categories", [])
@@ -170,12 +315,8 @@ async def get_user_news(user_id: str):
             # Step 3: Build intelligent contextual query from alert data
             alert_query = await build_contextual_query(alert, keywords, followup_questions, custom_question, category)
 
-            # Step 4: Use RAG system for intelligent article retrieval
-            relevant_articles = await rag_system.retrieve_personalized_news(
-                user_id=user_id,
-                query=alert_query,
-                limit=20  # Get more articles for this alert
-            )
+            # Step 4: Get category-specific articles without cross-contamination
+            relevant_articles = await get_alert_specific_articles(alert, alert_query, category)
 
             # Step 5: Apply intelligent contextual filtering per alert
             alert_context = {
@@ -189,7 +330,15 @@ async def get_user_news(user_id: str):
             # First apply intelligent content filtering
             contextually_relevant = await apply_intelligent_content_filtering(relevant_articles, alert_context)
 
-            # Then enhance with alert context
+            # Apply spam filtering for this alert
+            contextually_relevant = remove_obvious_spam_per_alert(contextually_relevant, alert)
+
+            # Apply intelligent filtering per alert (max 3 articles per alert)
+            if contextually_relevant:
+                contextually_relevant = await final_gemini_perfect_filter(contextually_relevant, [alert], 3)
+
+            # Enhance with alert context
+            alert_articles = []
             for article in contextually_relevant:
                 # Add alert-specific metadata
                 article['alert_id'] = str(alert_id)
@@ -200,29 +349,54 @@ async def get_user_news(user_id: str):
                     "keywords": keywords,
                     "relevance_score": article.get('relevance_score', 0)
                 }
+                alert_articles.append(article)
 
-                all_relevant_news.append(article)
+            # Create individual alert result
+            alert_satisfaction = await debug_user_satisfaction(alert_articles, [alert])
 
-        # Step 6: Remove obvious irrelevant articles first
-        all_relevant_news = remove_obvious_spam(all_relevant_news, user_alerts)
+            alert_result = {
+                "alert_id": str(alert_id),
+                "alert_category": category,
+                "alert_keywords": keywords,
+                "alert_query": alert_query,
+                "total_articles": len(alert_articles),
+                "articles": alert_articles,
+                "satisfaction_debug": alert_satisfaction
+            }
 
-        # Step 7: Final intelligent filtering with Gemini to get perfect results (max 3 articles)
-        if all_relevant_news:
-            all_relevant_news = await final_gemini_perfect_filter(all_relevant_news, user_alerts, 3)
+            alert_results.append(alert_result)
 
-        # Step 8: Final satisfaction debug check
-        satisfaction_report = await debug_user_satisfaction(all_relevant_news, user_alerts)
+        # Step 6: Learn from user alert patterns and update profile
+        all_articles_for_learning = []
+        for alert_result in alert_results:
+            all_articles_for_learning.extend(alert_result['articles'])
 
-        # Step 9: Learn from user alert patterns and update profile
-        await update_user_profile_from_alerts(user_id, user_alerts, all_relevant_news)
+        await update_user_profile_from_alerts(user_id, user_alerts, all_articles_for_learning)
+
+        # Step 7: Send WhatsApp notifications via WATI - Send all articles as separate notifications
+        whatsapp_results = []
+        for alert_result in alert_results:
+            if alert_result['articles']:  # Only send if articles found
+                # Send each article as a separate notification
+                for article in alert_result['articles']:
+                    # Create individual article result for notification
+                    individual_article_result = {
+                        **alert_result,
+                        'articles': [article]  # Send only one article per notification
+                    }
+                    wati_response = await send_wati_notification(user_id, individual_article_result)
+                    whatsapp_results.append(wati_response)
+
+                    # Add small delay between notifications to avoid rate limiting
+                    await asyncio.sleep(0.5)
 
         return {
             "status": "success",
             "user_id": user_id,
             "alerts_processed": len(user_alerts),
-            "total_articles": len(all_relevant_news),
-            "articles": all_relevant_news,
-            "satisfaction_debug": satisfaction_report,
+            "alert_results": alert_results,
+            "total_alerts_returned": len(alert_results),
+            "whatsapp_notifications": whatsapp_results,
             "timestamp": datetime.now()
         }
 
@@ -511,6 +685,260 @@ def remove_obvious_spam(articles: list, user_alerts: list) -> list:
         logger.error(f"Error in spam filtering: {e}")
         return articles
 
+def remove_obvious_spam_per_alert(articles: list, alert: dict) -> list:
+    """Remove spam for individual alert"""
+    try:
+        if not articles or not alert:
+            return articles
+
+        filtered_articles = []
+        keywords = [k.lower() for k in alert.get("sub_categories", [])]
+        category = alert.get("main_category", "").lower()
+
+        for article in articles:
+            title = article.get('title', '').lower()
+            content = article.get('content', '').lower() + ' ' + article.get('summary', '').lower()
+
+            # Keep if relevance score is decent
+            if article.get('relevance_score', 0) > 0.3:
+                filtered_articles.append(article)
+                continue
+
+            # Category-specific filtering
+            keep_article = False
+
+            if category == "sports" and 'cricket' in keywords:
+                if any(term in title + content for term in ['cricket', 'asia cup', 'asiacup']):
+                    keep_article = True
+            elif category == "news":
+                if any(term in title + content for term in ['modi', 'mann ki baat', 'pm']):
+                    keep_article = True
+            else:
+                keep_article = True
+
+            if keep_article:
+                filtered_articles.append(article)
+
+        return filtered_articles
+
+    except Exception as e:
+        logger.error(f"Error in per-alert spam filtering: {e}")
+        return articles
+
+async def send_wati_notification(user_id: str, alert_result: dict) -> dict:
+    """Send WhatsApp notification via WATI API with contact registration fallback"""
+    try:
+        print(f"🔍 WATI DEBUG: Starting WhatsApp notification for user_id: {user_id}")
+
+        # Get user's WhatsApp number from database - try multiple sources
+        whatsapp_number = None
+
+        # Try 1: Users collection
+        print(f"🔍 WATI DEBUG: Checking users collection for user_id: {user_id}")
+        user_doc = await db.get_collection("users").find_one({"user_id": user_id})
+        print(f"🔍 WATI DEBUG: User doc found: {user_doc is not None}")
+        if user_doc:
+            print(f"🔍 WATI DEBUG: User doc keys: {list(user_doc.keys())}")
+            # Check for direct whatsapp_number field
+            if user_doc.get("whatsapp_number"):
+                whatsapp_number = user_doc.get("whatsapp_number")
+                print(f"🔍 WATI DEBUG: Found WhatsApp number in users collection: {whatsapp_number}")
+            # Check for country_code + phone_number combination
+            elif user_doc.get("country_code") and user_doc.get("phone_number"):
+                country_code = user_doc.get("country_code")
+                phone_number = user_doc.get("phone_number")
+                whatsapp_number = f"{country_code}{phone_number}"
+                print(f"🔍 WATI DEBUG: Constructed WhatsApp number from country_code + phone_number: {whatsapp_number}")
+            # Check for just phone_number (might include country code)
+            elif user_doc.get("phone_number"):
+                phone_number = user_doc.get("phone_number")
+                # Add +91 if phone number doesn't start with +
+                if not phone_number.startswith('+'):
+                    whatsapp_number = f"+91{phone_number}"
+                else:
+                    whatsapp_number = phone_number
+                print(f"🔍 WATI DEBUG: Found phone_number in users collection: {whatsapp_number}")
+
+        # Try 2: User alerts collection (might have phone number)
+        if not whatsapp_number:
+            print(f"🔍 WATI DEBUG: Checking alerts collection for user_id: {user_id}")
+            alert_doc = await db.get_collection("alerts").find_one({"user_id": user_id})
+            print(f"🔍 WATI DEBUG: Alert doc found: {alert_doc is not None}")
+            if alert_doc:
+                print(f"🔍 WATI DEBUG: Alert doc keys: {list(alert_doc.keys())}")
+                if alert_doc.get("phone_number"):
+                    whatsapp_number = alert_doc.get("phone_number")
+                    print(f"🔍 WATI DEBUG: Found phone_number in alerts collection: {whatsapp_number}")
+                elif alert_doc.get("whatsapp_number"):
+                    whatsapp_number = alert_doc.get("whatsapp_number")
+                    print(f"🔍 WATI DEBUG: Found whatsapp_number in alerts collection: {whatsapp_number}")
+
+        # Try 3: Check if user_id itself looks like a phone number
+        if not whatsapp_number and user_id.isdigit() and len(user_id) >= 10:
+            whatsapp_number = user_id
+            print(f"🔍 WATI DEBUG: Using user_id as phone number: {whatsapp_number}")
+
+        if not whatsapp_number:
+            print(f"❌ WATI DEBUG: No WhatsApp number found for user {user_id}")
+            return {"status": "error", "message": "User WhatsApp number not found in any collection"}
+
+        # Get the best article for the alert
+        articles = alert_result.get('articles', [])
+        print(f"🔍 WATI DEBUG: Found {len(articles)} articles for notification")
+        if not articles:
+            print(f"❌ WATI DEBUG: No articles to send for user {user_id}")
+            return {"status": "skipped", "message": "No articles to send"}
+
+        best_article = articles[0]  # Get the highest relevance article
+        print(f"🔍 WATI DEBUG: Selected best article: {best_article.get('title', 'No title')[:50]}...")
+
+        # Prepare template parameters
+        # {{1}} = image URL
+        # {{2}} = title
+        # {{3}} = description
+
+        image_url = best_article.get('image_url', '') or best_article.get('enhanced_image_url', '')
+        title = best_article.get('enhanced_title', '') or best_article.get('title', '')
+        print(f"🔍 WATI DEBUG: Template params - Image URL: {image_url[:50]}..., Title: {title[:50]}...")
+
+        # Create short engaging description (keep it under 100 characters for WATI)
+        description = best_article.get('short_description', '')
+        if not description:
+            # Fallback to summary/content but keep it very short
+            content = best_article.get('summary', '') or best_article.get('content', '')
+            description = content[:80] + "..." if len(content) > 80 else content
+        else:
+            # Ensure short_description is also not too long
+            description = description[:80] + "..." if len(description) > 80 else description
+
+        print(f"🔍 WATI DEBUG: Final description length: {len(description)} chars")
+
+        print(f"🔍 WATI DEBUG: WATI payload prepared with template: {WATI_TEMPLATE_NAME}")
+
+        # Send WhatsApp message via WATI
+        headers = {
+            'Authorization': WATI_ACCESS_TOKEN,
+            'Content-Type': 'application/json-patch+json'
+        }
+
+        # Use correct WATI API format with receivers array
+        final_payload = {
+            "receivers": [
+                {
+                    "whatsappNumber": whatsapp_number,
+                    "customParams": [
+                        {
+                            "name": "1",
+                            "value": image_url
+                        },
+                        {
+                            "name": "2",
+                            "value": title
+                        },
+                        {
+                            "name": "3",
+                            "value": description
+                        }
+                    ]
+                }
+            ],
+            "template_name": WATI_TEMPLATE_NAME,
+            "broadcast_name": WATI_BROADCAST_NAME
+        }
+
+        # Alternative payload format for testing - comment out the above and try this if needed
+        # final_payload = {
+        #     "whatsappNumber": whatsapp_number,
+        #     "templateName": WATI_TEMPLATE_NAME,
+        #     "broadcastName": WATI_BROADCAST_NAME,  # Remove alert category from broadcast name
+        #     "templateData": {
+        #         "1": image_url,
+        #         "2": title,
+        #         "3": description
+        #     }
+        # }
+
+        # Use correct WATI endpoint - sendTemplateMessages (plural)
+        api_endpoint = f"{WATI_BASE_URL}/api/v1/sendTemplateMessages"
+        print(f"🔍 WATI DEBUG: Sending API request to: {api_endpoint}")
+        print(f"🔍 WATI DEBUG: WhatsApp number: {whatsapp_number}")
+        print(f"🔍 WATI DEBUG: WhatsApp number length: {len(whatsapp_number)}")
+        print(f"🔍 WATI DEBUG: WhatsApp number format check: starts with +: {whatsapp_number.startswith('+')}")
+        print(f"🔍 WATI DEBUG: Headers: Authorization present: {bool(headers.get('Authorization'))}")
+        print(f"🔍 WATI DEBUG: Final payload keys: {list(final_payload.keys())}")
+        print(f"🔍 WATI DEBUG: Complete payload: {final_payload}")
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                response = await client.post(
+                    api_endpoint,
+                    headers=headers,
+                    json=final_payload
+                )
+
+                print(f"🔍 WATI DEBUG: API Response Status: {response.status_code}")
+                print(f"🔍 WATI DEBUG: API Response Headers: {dict(response.headers)}")
+                print(f"🔍 WATI DEBUG: API Response Text: {response.text}")
+
+                # Parse response JSON to check WATI-specific success/error format
+                try:
+                    response_data = response.json()
+                    print(f"🔍 WATI DEBUG: Parsed Response Data: {response_data}")
+
+                    # Check WATI response format: {"result": true/false, "errors": {...}}
+                    wati_result = response_data.get("result", False)
+                    wati_errors = response_data.get("errors", {})
+
+                    if response.status_code == 200 and wati_result:
+                        print(f"✅ WATI DEBUG: WhatsApp notification sent successfully to {whatsapp_number}")
+                        logger.info(f"WhatsApp notification sent successfully to {whatsapp_number}")
+                        return {
+                            "status": "success",
+                            "whatsapp_number": whatsapp_number,
+                            "template_used": WATI_TEMPLATE_NAME,
+                            "article_title": title,
+                            "message": "Notification sent successfully",
+                            "wati_response": response_data
+                        }
+                    else:
+                        error_msg = wati_errors.get("error", "Unknown WATI error")
+                        invalid_numbers = wati_errors.get("invalidWhatsappNumbers", [])
+                        invalid_params = wati_errors.get("invalidCustomParameters", [])
+
+                        print(f"❌ WATI DEBUG: WATI API Error - Result: {wati_result}")
+                        print(f"❌ WATI DEBUG: Error message: {error_msg}")
+                        print(f"❌ WATI DEBUG: Invalid WhatsApp numbers: {invalid_numbers}")
+                        print(f"❌ WATI DEBUG: Invalid parameters: {invalid_params}")
+
+                        logger.error(f"WATI API error: {error_msg}")
+                        return {
+                            "status": "error",
+                            "message": f"WATI API error: {error_msg}",
+                            "invalid_numbers": invalid_numbers,
+                            "invalid_params": invalid_params,
+                            "response": response_data
+                        }
+
+                except json.JSONDecodeError:
+                    print(f"❌ WATI DEBUG: Could not parse response as JSON")
+                    print(f"❌ WATI DEBUG: Raw response: {response.text}")
+                    logger.error(f"WATI API error: {response.status_code} - {response.text}")
+                    return {
+                        "status": "error",
+                        "message": f"WATI API error: {response.status_code}",
+                        "response": response.text
+                    }
+            except Exception as api_error:
+                print(f"❌ WATI DEBUG: API Call Exception: {api_error}")
+                raise api_error
+
+    except Exception as e:
+        logger.error(f"Error sending WATI notification: {e}")
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
 async def final_gemini_perfect_filter(articles: list, user_alerts: list, target_count: int) -> list:
     """Use Gemini to select only the most perfectly relevant articles"""
     try:
@@ -540,45 +968,84 @@ async def final_gemini_perfect_filter(articles: list, user_alerts: list, target_
             }
             articles_for_analysis.append(article_data)
 
-        # Create comprehensive intelligent prompt that does everything in one call
+        # Create ultra-intelligent perfect prompt with deep analysis
         perfect_prompt = f"""
-        You are an expert news curator. Analyze user requirements and select ONLY the {target_count} most satisfying articles.
+        You are an elite AI news curator with deep psychological understanding of user preferences and engagement patterns.
 
-        USER PROFILE ANALYSIS:
-        - Main Category: {user_context.get('category', '')}
-        - Sub-Categories/Keywords: {user_context.get('keywords', [])}
-        - Follow-up Questions: {user_context.get('followup_questions', [])}
-        - Custom Question: {user_context.get('custom_question', '')}
-        - User Intent: {user_context.get('intent', '')}
+        🎯 USER PROFILE DEEP ANALYSIS:
+        Primary Interest: {user_context.get('category', '').upper()}
+        Specific Focus: {' + '.join(user_context.get('keywords', []))}
+        Intent Signals: {user_context.get('followup_questions', [])}
+        Personal Goal: "{user_context.get('custom_question', '')}"
+        Engagement Type: Real-time notification seeking
 
-        AVAILABLE ARTICLES:
+        📰 CANDIDATE ARTICLES FOR ANALYSIS:
         {json.dumps(articles_for_analysis, indent=2)}
 
-        TASK: Select {target_count} articles that will make the user happy and satisfied. For each selected article, provide:
-        1. Enhanced title (engaging, clickable)
-        2. Short description (2-3 lines that hook the user)
-        3. Satisfaction reason (why user will love this)
+        🧠 ADVANCED CURATION MISSION:
+        You must psychologically analyze each article and select EXACTLY {target_count} that will:
+        1. Create immediate emotional connection with user
+        2. Satisfy their specific intent and curiosity
+        3. Provide actionable or exciting information
+        4. Make them feel their alert was worthwhile
 
-        Note: Images will be taken directly from RSS feeds, no need to suggest images.
+        🔍 MULTI-DIMENSIONAL SELECTION CRITERIA:
 
-        SELECTION CRITERIA:
-        ✅ Perfectly matches main category + sub-categories
-        ✅ Addresses follow-up questions and custom questions
-        ✅ Recent and valuable content
-        ✅ Will genuinely interest and satisfy the user
-        ✅ No duplicate or similar content
+        RELEVANCE ANALYSIS:
+        • Direct keyword presence and context relevance
+        • Semantic alignment with user's true intent
+        • Timeliness and breaking news value
+        • Exclusivity or unique angle
 
-        RESPOND WITH JSON:
+        ENGAGEMENT PSYCHOLOGY:
+        • Will this create excitement/curiosity?
+        • Does it answer their "why should I care?" question?
+        • Is there emotional hook (victory, drama, surprise)?
+        • Does it provide insider/expert insight?
+
+        CONTENT QUALITY:
+        • Substantive content vs. fluff
+        • Recent and credible sources
+        • No duplicate storylines or angles
+        • Clear value proposition for the user
+
+        🎨 CONTENT ENHANCEMENT REQUIREMENTS:
+
+        ENHANCED TITLE RULES:
+        • Use power words (Ultimate, Exclusive, Breaking, Secret, Master)
+        • Include emotional triggers (triumph, shock, revelation)
+        • Add context clues that matter to user (India, Final, Victory)
+        • Make it irresistibly clickable but not clickbait
+        • Maximum 60 characters for mobile optimization
+
+        SHORT DESCRIPTION FORMULA:
+        Line 1: Hook - What happened that's exciting/important
+        Line 2: Context - Why it matters specifically to this user
+        Line 3: Teaser - What they'll discover by reading (optional)
+
+        📊 SATISFACTION PREDICTION:
+        For each selected article, predict user satisfaction level:
+        🔥 PERFECT (95-100%): Exactly what they've been waiting for
+        ⭐ EXCELLENT (85-94%): Highly relevant and engaging
+        ✅ GOOD (75-84%): Solid match, will satisfy
+        ⚠️ FAIR (60-74%): Relevant but may disappoint
+
+        ONLY SELECT ARTICLES PREDICTED AT 85%+ SATISFACTION!
+
+        🎯 JSON RESPONSE FORMAT:
         [
             {{
                 "article_id": 0,
-                "enhanced_title": "Engaging title that makes user want to click",
-                "short_description": "2-3 lines that perfectly explain why this news matters to the user and hooks their interest",
-                "satisfaction_reason": "Specific reason why this article perfectly satisfies user's intent and will make them happy"
+                "enhanced_title": "🏆 Asia Cup Final: India's Secret Weapon Against Pakistan Revealed!",
+                "short_description": "Coach Morkel drops bombshell hints about India's match-winning strategy just hours before the ultimate showdown. This could be the tactical masterclass that crushes Pakistan's World Cup dreams and delivers the victory you've been waiting for!",
+                "satisfaction_reason": "PERFECT match - Covers Asia Cup final with India vs Pakistan angle, includes strategic insights, directly relates to user's victory notification intent",
+                "predicted_satisfaction": "PERFECT - 98%",
+                "engagement_factors": ["Strategic insights", "India focus", "Victory potential", "Expert analysis"]
             }}
         ]
 
-        Select maximum {target_count} articles that will truly satisfy the user!
+        Remember: Quality over quantity. Better to return {target_count-1} perfect articles than {target_count} mediocre ones.
+        ONLY select articles that will make the user think "This is EXACTLY why I set up this alert!"
         """
 
         # Call Gemini for perfect filtering
@@ -608,23 +1075,28 @@ async def final_gemini_perfect_filter(articles: list, user_alerts: list, target_
                     if json_match:
                         perfect_results = json.loads(json_match.group())
 
-                        # Get enhanced articles with all the intelligent additions
+                        # Get ultra-enhanced articles with psychological intelligence
                         perfect_articles = []
                         for selection in perfect_results:
                             article_idx = selection.get('article_id')
                             enhanced_title = selection.get('enhanced_title', '')
                             short_description = selection.get('short_description', '')
                             satisfaction_reason = selection.get('satisfaction_reason', '')
+                            predicted_satisfaction = selection.get('predicted_satisfaction', 'GOOD - 80%')
+                            engagement_factors = selection.get('engagement_factors', [])
 
                             if 0 <= article_idx < len(articles):
                                 selected_article = articles[article_idx]
 
-                                # Add intelligent enhancements (image comes from RSS)
+                                # Add elite-level intelligent enhancements
                                 selected_article['enhanced_title'] = enhanced_title
                                 selected_article['short_description'] = short_description
                                 selected_article['satisfaction_reason'] = satisfaction_reason
+                                selected_article['predicted_satisfaction'] = predicted_satisfaction
+                                selected_article['engagement_factors'] = engagement_factors
                                 selected_article['perfect_match'] = True
-                                selected_article['user_satisfaction_score'] = 10  # Perfect match
+                                selected_article['curation_quality'] = 'ELITE_AI_SELECTED'
+                                selected_article['user_satisfaction_score'] = 10
                                 # image_url already exists from RSS extraction
 
                                 perfect_articles.append(selected_article)
@@ -646,6 +1118,95 @@ async def final_gemini_perfect_filter(articles: list, user_alerts: list, target_
     except Exception as e:
         logger.error(f"Error in perfect filtering: {e}")
         return articles[:target_count]
+
+async def get_alert_specific_articles(alert: dict, alert_query: str, category: str) -> list:
+    """Get articles specific to this alert without mixing with other alerts"""
+    try:
+        _ = alert  # Parameter kept for future extensibility
+        logger.info(f"Fetching alert-specific articles for category: {category}")
+
+        if category not in CATEGORY_RSS_FEEDS:
+            return []
+
+        # Step 1: Fetch fresh RSS articles for this specific category
+        category_feeds = CATEGORY_RSS_FEEDS[category]
+        category_articles = []
+
+        for feed_url in category_feeds:
+            feed_articles = await fetch_rss_feed(feed_url)
+            for article in feed_articles:
+                article['category'] = category
+                category_articles.append(article)
+
+        if not category_articles:
+            return []
+
+        # Step 2: Simple semantic matching without polluting global vector store
+        from sentence_transformers import SentenceTransformer
+
+        # Use a lightweight model for quick similarity
+        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+        # Generate query embedding
+        query_embedding = model.encode(alert_query)
+
+        # Filter articles from last 24 hours only
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        cutoff_time = now - timedelta(hours=24)
+
+        recent_articles = []
+        for article in category_articles:
+            try:
+                # Parse published date
+                published_date_str = article.get('published_date', '')
+                if published_date_str:
+                    # Handle different date formats
+                    try:
+                        # Format: "Sun, 28 Sep 2025 14:05:56 +0530"
+                        from email.utils import parsedate_to_datetime
+                        published_date = parsedate_to_datetime(published_date_str)
+
+                        # Check if article is within last 24 hours
+                        if published_date >= cutoff_time:
+                            recent_articles.append(article)
+                    except:
+                        # If date parsing fails, include the article (better to show than miss)
+                        recent_articles.append(article)
+                else:
+                    # If no date, include the article
+                    recent_articles.append(article)
+            except:
+                # If any error, include the article
+                recent_articles.append(article)
+
+        logger.info(f"24-hour filter: {len(category_articles)} -> {len(recent_articles)} recent articles")
+
+        # Generate embeddings for recent articles and calculate similarity
+        scored_articles = []
+        for article in recent_articles:
+            article_text = f"{article.get('title', '')} {article.get('content', '')} {article.get('summary', '')}"
+            article_embedding = model.encode(article_text)
+
+            # Calculate cosine similarity
+            import numpy as np
+            similarity = np.dot(query_embedding, article_embedding) / (
+                np.linalg.norm(query_embedding) * np.linalg.norm(article_embedding)
+            )
+
+            article['relevance_score'] = float(similarity)
+            if similarity > 0.1:  # Lowered threshold to catch more relevant articles
+                scored_articles.append(article)
+
+        # Step 3: Sort by relevance and return top articles
+        scored_articles.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
+
+        logger.info(f"Alert-specific filtering: {len(category_articles)} -> {len(scored_articles)} relevant articles")
+        return scored_articles[:15]  # Return top 15 relevant articles
+
+    except Exception as e:
+        logger.error(f"Error in alert-specific article retrieval: {e}")
+        return []
 
 async def debug_user_satisfaction(articles: list, user_alerts: list) -> dict:
     """Debug function to check if articles will satisfy user requirements"""
@@ -679,8 +1240,10 @@ async def debug_user_satisfaction(articles: list, user_alerts: list) -> dict:
                 'custom_match': False
             }
 
-            # Category check
-            if user_requirements['main_category'] == 'sports' and article.get('category', '').lower() == 'sports':
+            # Category check - Fixed to work for all categories
+            user_category = user_requirements['main_category']
+            article_category = article.get('category', '').lower()
+            if user_category == article_category:
                 matches['category_match'] = True
 
             # Keywords check

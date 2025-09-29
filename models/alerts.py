@@ -12,6 +12,20 @@ class CategoryType(str, Enum):
     Custom_Input = "Custom_Input"
 
 
+class FrequencyType(str, Enum):
+    realtime = "realtime"
+    hourly = "hourly"
+    daily = "daily"
+    weekly = "weekly"
+
+
+class ScheduleSettings(BaseModel):
+    frequency: FrequencyType = Field(..., description="How often to send notifications")
+    time: Optional[str] = Field(default="09:00", description="Time for daily/weekly alerts (HH:MM format)")
+    days: Optional[List[str]] = Field(default=[], description="Days for weekly alerts: ['monday', 'friday']")
+    timezone: Optional[str] = Field(default="Asia/Kolkata", description="User timezone")
+
+
 class AlertBase(BaseModel):
     main_category: CategoryType = Field(..., description="Fixed main category enum")
     sub_categories: Optional[List[str]] = Field(

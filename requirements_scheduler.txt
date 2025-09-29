@@ -1,0 +1,2 @@
+# Additional requirements for scheduled alerts
+pytz>=2023.3

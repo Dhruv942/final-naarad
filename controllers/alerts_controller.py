@@ -139,3 +139,60 @@ async def update_alert_last_sent(alert_id: str):
         {"alert_id": alert_id},
         {"$set": {"last_sent": datetime.now()}}
     )
+
+
+async def schedule_one_time_notification(user_id: str, alert_id: str, scheduled_datetime: datetime, articles_data: list):
+    """Store one-time scheduled notification"""
+    from db.mongo import db
+
+    scheduled_notification = {
+        "user_id": user_id,
+        "alert_id": alert_id,
+        "scheduled_time": scheduled_datetime,
+        "articles": articles_data,
+        "status": "pending",  # pending, sent, failed
+        "created_at": datetime.now(),
+        "attempts": 0
+    }
+
+    # Store in separate collection for one-time notifications
+    await db.get_collection("scheduled_notifications").insert_one(scheduled_notification)
+    return scheduled_notification
+
+
+async def get_pending_scheduled_notifications():
+    """Get all pending scheduled notifications that need to be sent"""
+    from db.mongo import db
+
+    notifications = []
+    cursor = db.get_collection("scheduled_notifications").find({
+        "status": "pending",
+        "scheduled_time": {"$lte": datetime.now()}  # Time has arrived
+    })
+
+    async for notification in cursor:
+        notifications.append(notification)
+
+    return notifications
+
+
+async def mark_notification_as_sent(notification_id):
+    """Mark notification as sent and delete it"""
+    from db.mongo import db
+
+    await db.get_collection("scheduled_notifications").delete_one({
+        "_id": notification_id
+    })
+
+
+async def mark_notification_as_failed(notification_id):
+    """Mark notification as failed for retry"""
+    from db.mongo import db
+
+    await db.get_collection("scheduled_notifications").update_one(
+        {"_id": notification_id},
+        {
+            "$set": {"status": "failed"},
+            "$inc": {"attempts": 1}
+        }
+    )
