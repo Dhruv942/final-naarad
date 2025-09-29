@@ -1141,11 +1141,9 @@ async def get_alert_specific_articles(alert: dict, alert_query: str, category: s
         if not category_articles:
             return []
 
-        # Step 2: Simple semantic matching without polluting global vector store
-        from sentence_transformers import SentenceTransformer
-
-        # Use a lightweight model for quick similarity
-        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        # Step 2: Use existing RAG system's embedding model (memory efficient)
+        # Reuse the same model instead of loading a new one
+        model = rag_system.embedding_model
 
         # Generate query embedding
         query_embedding = model.encode(alert_query)
