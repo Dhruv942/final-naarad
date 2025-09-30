@@ -1,16 +1,13 @@
 import motor.motor_asyncio
-from urllib.parse import quote_plus
+from pymongo.server_api import ServerApi
 
-# MongoDB Configuration - Use local for development (no SSL issues)
-# For production, use the commented Atlas connection
-MONGO_DETAILS = "mongodb://localhost:27017"
+# MongoDB Configuration - Atlas connection
+uri = "mongodb+srv://dhruvvpatel1010_db_user:yODfw0sTRAX6nFzw@naarad.xyujaxp.mongodb.net/?retryWrites=true&w=majority&appName=naarad"
 
-# Production MongoDB Atlas (uncomment when SSL fixed)
-# username = quote_plus("dhruvvpatel1010_db_user")
-# password = quote_plus("Naarad@ss37")
-# MONGO_DETAILS = f"mongodb+srv://{username}:{password}@production-naarad.x7gpsod.mongodb.net/?retryWrites=true&w=majority&appName=production-naarad&ssl=true&ssl_cert_reqs=CERT_NONE"
+# Local MongoDB for development (uncomment if needed)
+# uri = "mongodb://localhost:27017"
 
-client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_DETAILS)
+client = motor.motor_asyncio.AsyncIOMotorClient(uri, server_api=ServerApi('1'))
 db = client.stagin_local
 
 # Collections
