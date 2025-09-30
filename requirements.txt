@@ -1,20 +1,12 @@
-fastapi
-uvicorn[standard]
-motor
-pydantic
-requests
-beautifulsoup4
-lxml
-sentence-transformers
-torch
-numpy
-apscheduler
-langchain
-openai
-python-dotenv
-feedparser
-httpx
-pymongo
-scikit-learn
-transformers
-datasets
+ fastapi
+  uvicorn[standard]
+  motor
+  pymongo
+  pydantic
+  python-dotenv
+  feedparser
+  httpx
+  sentence-transformers
+  numpy
+  python-jose[cryptography]
+  pytz
