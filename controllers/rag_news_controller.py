@@ -21,7 +21,7 @@ from db.mongo import db  # Use existing MongoDB connection
 logger = logging.getLogger(__name__)
 
 # API Configuration
-GEMINI_API_KEY = 'AIzaSyCpPZ2xRGJGx06tZFw_XfU_RTsBiIF_afg'
+GEMINI_API_KEY = 'AIzaSyB4vE8BAkg0J0XZ2bvMR9U4iNs3DfeONS0'
 
 # WATI WhatsApp Configuration
 WATI_ACCESS_TOKEN = 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJiZGVmNjQ0OS02NDU3LTRiNDYtOTM4Mi03YjNiYmRmMmY2NGIiLCJ1bmlxdWVfbmFtZSI6ImFjdHVhbGx5dXNlZnVsZXh0ZW5zaW9uc0BnbWFpbC5jb20iLCJuYW1laWQiOiJhY3R1YWxseXVzZWZ1bGV4dGVuc2lvbnNAZ21haWwuY29tIiwiZW1haWwiOiJhY3R1YWxseXVzZWZ1bGV4dGVuc2lvbnNAZ21haWwuY29tIiwiYXV0aF90aW1lIjoiMDkvMjgvMjAyNSAxMjowNzo1OCIsInRlbmFudF9pZCI6IjQ1ODkxMyIsImRiX25hbWUiOiJtdC1wcm9kLVRlbmFudHMiLCJodHRwOi8vc2NoZW1hcy5taWNyb3NvZnQuY29tL3dzLzIwMDgvMDYvaWRlbnRpdHkvY2xhaW1zL3JvbGUiOiJBRE1JTklTVFJBVE9SIiwiZXhwIjoyNTM0MDIzMDA4MDAsImlzcyI6IkNsYXJlX0FJIiwiYXVkIjoiQ2xhcmVfQUkifQ.WPoEwLq2UdUs8Rl61SklQMFQ699mj1CqQ2v7iPZunuU'
@@ -36,27 +36,27 @@ rag_system = RAGSystem(db, GEMINI_API_KEY)
 router = APIRouter()
 
 # =============================================================================
-# 5-MINUTE CRON JOB FOR AUTOMATED NEWS ALERTS WITH USER PREFERENCES
+# 30-MINUTE CRON JOB FOR AUTOMATED NEWS ALERTS WITH USER PREFERENCES
 # =============================================================================
 
 class NewsAlertScheduler:
-    """5-minute scheduler for automated news alerts"""
+    """30-minute scheduler for automated news alerts"""
 
     def __init__(self):
         self.running = False
 
     async def start_scheduler(self):
-        """Start the 5-minute scheduler"""
+        """Start the 30-minute scheduler"""
         self.running = True
-        logger.info("🔔 News Alert Scheduler started (5-minute interval)")
+        logger.info("🔔 News Alert Scheduler started (30-minute interval)")
 
         while self.running:
             try:
                 await self.process_automated_alerts()
-                await asyncio.sleep(300)  # 5 minutes
+                await asyncio.sleep(1800)  # 30 minutes
             except Exception as e:
                 logger.error(f"Error in scheduler: {e}")
-                await asyncio.sleep(300)
+                await asyncio.sleep(1800)  # 30 minutes
 
     def stop_scheduler(self):
         """Stop the scheduler"""
@@ -173,7 +173,7 @@ def stop_news_scheduler():
 # RSS Feeds Configuration
 CATEGORY_RSS_FEEDS = {
     "sports": [
-        "https://www.thehindu.com/sport/feeder/default.rss",
+        "w",
         "https://feeds.bbci.co.uk/sport/rss.xml",
         "https://rss.cnn.com/rss/edition_sport.rss"
     ],
@@ -333,9 +333,9 @@ async def get_user_news(user_id: str):
             # Apply spam filtering for this alert
             contextually_relevant = remove_obvious_spam_per_alert(contextually_relevant, alert)
 
-            # Apply intelligent filtering per alert (max 3 articles per alert)
+            # Apply intelligent filtering per alert (max 1 article - BEST ONE ONLY)
             if contextually_relevant:
-                contextually_relevant = await final_gemini_perfect_filter(contextually_relevant, [alert], 3)
+                contextually_relevant = await final_gemini_perfect_filter(contextually_relevant, [alert], 1)
 
             # Enhance with alert context
             alert_articles = []
@@ -374,11 +374,32 @@ async def get_user_news(user_id: str):
         await update_user_profile_from_alerts(user_id, user_alerts, all_articles_for_learning)
 
         # Step 7: Send WhatsApp notifications via WATI - Send all articles as separate notifications
+        # Check for duplicate articles before sending
+        sent_notifications_collection = db.get_collection("sent_notifications")
         whatsapp_results = []
+
         for alert_result in alert_results:
             if alert_result['articles']:  # Only send if articles found
                 # Send each article as a separate notification
                 for article in alert_result['articles']:
+                    article_url = article.get('url', '')
+
+                    # Check if this article was already sent to this user
+                    if article_url:
+                        existing_notification = await sent_notifications_collection.find_one({
+                            "user_id": user_id,
+                            "article_url": article_url
+                        })
+
+                        if existing_notification:
+                            logger.info(f"Skipping duplicate article for {user_id}: {article.get('title', '')[:50]}")
+                            whatsapp_results.append({
+                                "status": "skipped",
+                                "message": "Duplicate article already sent",
+                                "article_title": article.get('title', '')
+                            })
+                            continue
+
                     # Create individual article result for notification
                     individual_article_result = {
                         **alert_result,
@@ -386,6 +407,16 @@ async def get_user_news(user_id: str):
                     }
                     wati_response = await send_wati_notification(user_id, individual_article_result)
                     whatsapp_results.append(wati_response)
+
+                    # If successfully sent, record it to prevent future duplicates
+                    if wati_response.get("status") == "success" and article_url:
+                        await sent_notifications_collection.insert_one({
+                            "user_id": user_id,
+                            "article_url": article_url,
+                            "article_title": article.get('title', ''),
+                            "alert_id": alert_result.get('alert_id'),
+                            "sent_at": datetime.now(timezone.utc)
+                        })
 
                     # Add small delay between notifications to avoid rate limiting
                     await asyncio.sleep(0.5)
@@ -686,7 +717,7 @@ def remove_obvious_spam(articles: list, user_alerts: list) -> list:
         return articles
 
 def remove_obvious_spam_per_alert(articles: list, alert: dict) -> list:
-    """Remove spam for individual alert"""
+    """Strong ML/RAG-based filtering - reduces dependency on Gemini"""
     try:
         if not articles or not alert:
             return articles
@@ -694,35 +725,70 @@ def remove_obvious_spam_per_alert(articles: list, alert: dict) -> list:
         filtered_articles = []
         keywords = [k.lower() for k in alert.get("sub_categories", [])]
         category = alert.get("main_category", "").lower()
+        followup_questions = [q.lower() for q in alert.get("followup_questions", [])]
+        custom_question = alert.get("custom_question", "").lower()
+
+        # Build comprehensive user intent profile
+        all_user_text = ' '.join(keywords + followup_questions + [custom_question])
+        user_intent_keywords = set(word for word in all_user_text.split() if len(word) > 3)
+
+        # If no user intent, accept all articles from same category
+        if not user_intent_keywords:
+            return articles
 
         for article in articles:
             title = article.get('title', '').lower()
-            content = article.get('content', '').lower() + ' ' + article.get('summary', '').lower()
+            content = article.get('content', '').lower() + ' ' + article.get('summary', '').lower() + ' ' + article.get('description', '').lower()
+            article_text = title + ' ' + content
+            article_category = article.get('category', '').lower()
 
-            # Keep if relevance score is decent
-            if article.get('relevance_score', 0) > 0.3:
-                filtered_articles.append(article)
+            # STEP 1: Category must match (basic filter)
+            if article_category != category:
                 continue
 
-            # Category-specific filtering
+            # STEP 2: ML/RAG Relevance Score (primary signal)
+            relevance_score = article.get('relevance_score', 0)
+
+            # STEP 3: Keyword overlap analysis (semantic matching)
+            matched_keywords = [kw for kw in user_intent_keywords if kw in article_text]
+            keyword_match_count = len(matched_keywords)
+            keyword_match_ratio = keyword_match_count / len(user_intent_keywords) if user_intent_keywords else 0
+
+            # STEP 4: Title relevance (titles are usually more focused)
+            title_keyword_matches = sum(1 for kw in user_intent_keywords if kw in title)
+
+            # STEP 5: Strong ML-based filtering logic
+            # Prioritize RAG relevance score but validate with keyword matching
             keep_article = False
 
-            if category == "sports" and 'cricket' in keywords:
-                if any(term in title + content for term in ['cricket', 'asia cup', 'asiacup']):
-                    keep_article = True
-            elif category == "news":
-                if any(term in title + content for term in ['modi', 'mann ki baat', 'pm']):
-                    keep_article = True
-            else:
+            # High confidence: Strong RAG score + keyword matches
+            if relevance_score > 0.5 and keyword_match_count >= 2:
+                keep_article = True
+            # Medium-high confidence: Good RAG score + some keyword matches
+            elif relevance_score > 0.4 and keyword_match_count >= 1:
+                keep_article = True
+            # Title match: Keywords in title are strong signals
+            elif title_keyword_matches >= 2:
+                keep_article = True
+            # Moderate confidence: Decent overlap ratio
+            elif keyword_match_ratio >= 0.4 and relevance_score > 0.3:
+                keep_article = True
+            # Strong keyword presence even if lower RAG score
+            elif keyword_match_count >= 3:
                 keep_article = True
 
             if keep_article:
+                # Add match metadata for Gemini to use
+                article['ml_keyword_matches'] = matched_keywords
+                article['ml_match_ratio'] = keyword_match_ratio
+                article['ml_confidence'] = relevance_score
                 filtered_articles.append(article)
 
+        logger.info(f"ML/RAG filter for {category}: {len(articles)} -> {len(filtered_articles)} articles (RAG score + keyword matching)")
         return filtered_articles
 
     except Exception as e:
-        logger.error(f"Error in per-alert spam filtering: {e}")
+        logger.error(f"Error in ML/RAG filtering: {e}")
         return articles
 
 async def send_wati_notification(user_id: str, alert_result: dict) -> dict:
@@ -801,15 +867,15 @@ async def send_wati_notification(user_id: str, alert_result: dict) -> dict:
         title = best_article.get('enhanced_title', '') or best_article.get('title', '')
         print(f"🔍 WATI DEBUG: Template params - Image URL: {image_url[:50]}..., Title: {title[:50]}...")
 
-        # Create short engaging description (keep it under 100 characters for WATI)
+        # Get full description - no truncation
         description = best_article.get('short_description', '')
         if not description:
-            # Fallback to summary/content but keep it very short
-            content = best_article.get('summary', '') or best_article.get('content', '')
-            description = content[:80] + "..." if len(content) > 80 else content
-        else:
-            # Ensure short_description is also not too long
-            description = description[:80] + "..." if len(description) > 80 else description
+            # Fallback to full summary/content - send complete text
+            description = best_article.get('summary', '') or best_article.get('content', '') or best_article.get('description', '')
+
+        # If still empty, use a default message
+        if not description:
+            description = "Read full article for details."
 
         print(f"🔍 WATI DEBUG: Final description length: {len(description)} chars")
 
@@ -956,96 +1022,83 @@ async def final_gemini_perfect_filter(articles: list, user_alerts: list, target_
                 'intent': f"User wants {alert.get('main_category', '')} news about {', '.join(alert.get('sub_categories', []))}"
             }
 
-        # Prepare articles for analysis
+        # Prepare articles for analysis with ML metadata
         articles_for_analysis = []
-        for idx, article in enumerate(articles[:15]):  # Analyze top 15 to find best 2-3
+        for idx, article in enumerate(articles[:15]):  # Analyze top 15 to find best
             article_data = {
                 'id': idx,
                 'title': article.get('title', ''),
                 'content': (article.get('content', '') or article.get('summary', '') or article.get('description', ''))[:400],
                 'url': article.get('url', ''),
-                'relevance_score': article.get('relevance_score', 0)
+                'ml_relevance_score': article.get('relevance_score', 0),
+                'ml_keyword_matches': article.get('ml_keyword_matches', []),
+                'ml_match_ratio': article.get('ml_match_ratio', 0),
+                'ml_confidence': article.get('ml_confidence', 0)
             }
             articles_for_analysis.append(article_data)
 
-        # Create ultra-intelligent perfect prompt with deep analysis
+        # Extract user context dynamically
+        user_keywords = user_context.get('keywords', [])
+        user_questions = user_context.get('followup_questions', [])
+        user_custom = user_context.get('custom_question', '')
+        user_category = user_context.get('category', '')
+
+        # Detect gender/demographic context
+        all_user_text = ' '.join(user_keywords + user_questions + [user_custom]).lower()
+        is_womens_context = any(term in all_user_text for term in ["women's", 'womens', 'women', 'female', 'ladies'])
+        gender_context = "Women's" if is_womens_context else "Men's/General"
+
+        # Create dynamic filtering rules based on user's actual input
+        user_specific_terms = set()
+        for text in user_keywords + user_questions + [user_custom]:
+            user_specific_terms.update([word for word in text.lower().split() if len(word) > 3])
+
+        # Create AI prompt that leverages ML/RAG scores
         perfect_prompt = f"""
-        You are an elite AI news curator with deep psychological understanding of user preferences and engagement patterns.
+        You are the final validation layer. These articles are PRE-FILTERED by ML/RAG models.
 
-        🎯 USER PROFILE DEEP ANALYSIS:
-        Primary Interest: {user_context.get('category', '').upper()}
-        Specific Focus: {' + '.join(user_context.get('keywords', []))}
-        Intent Signals: {user_context.get('followup_questions', [])}
-        Personal Goal: "{user_context.get('custom_question', '')}"
-        Engagement Type: Real-time notification seeking
+        USER'S REQUEST:
+        Category: {user_category}
+        Keywords: {user_keywords}
+        Questions: {user_questions}
+        Custom Question: "{user_custom}"
 
-        📰 CANDIDATE ARTICLES FOR ANALYSIS:
+        ML-FILTERED ARTICLES:
         {json.dumps(articles_for_analysis, indent=2)}
 
-        🧠 ADVANCED CURATION MISSION:
-        You must psychologically analyze each article and select EXACTLY {target_count} that will:
-        1. Create immediate emotional connection with user
-        2. Satisfy their specific intent and curiosity
-        3. Provide actionable or exciting information
-        4. Make them feel their alert was worthwhile
+        ML/RAG SIGNALS EXPLAINED:
+        - ml_relevance_score: Semantic similarity (0-1) from embedding models
+        - ml_keyword_matches: User keywords found in article
+        - ml_match_ratio: % of user keywords matched
+        - ml_confidence: Overall ML confidence
 
-        🔍 MULTI-DIMENSIONAL SELECTION CRITERIA:
+        YOUR ROLE (Final Semantic Validation):
+        1. ML has already filtered - trust the ml_relevance_score
+        2. Check if ML matches align with user's TRUE context
+        3. Select BEST {target_count} article(s) that will satisfy user
 
-        RELEVANCE ANALYSIS:
-        • Direct keyword presence and context relevance
-        • Semantic alignment with user's true intent
-        • Timeliness and breaking news value
-        • Exclusivity or unique angle
+        VALIDATION CHECKS:
+        - Does context match? (If user mentions "Rahul", is article about male cricket?)
+        - Does format match? (Test vs ODI, Bollywood vs Hollywood, etc.)
+        - Will this answer: "{user_custom}"?
+        - Are ml_keyword_matches actually relevant?
 
-        ENGAGEMENT PSYCHOLOGY:
-        • Will this create excitement/curiosity?
-        • Does it answer their "why should I care?" question?
-        • Is there emotional hook (victory, drama, surprise)?
-        • Does it provide insider/expert insight?
-
-        CONTENT QUALITY:
-        • Substantive content vs. fluff
-        • Recent and credible sources
-        • No duplicate storylines or angles
-        • Clear value proposition for the user
-
-        🎨 CONTENT ENHANCEMENT REQUIREMENTS:
-
-        ENHANCED TITLE RULES:
-        • Use power words (Ultimate, Exclusive, Breaking, Secret, Master)
-        • Include emotional triggers (triumph, shock, revelation)
-        • Add context clues that matter to user (India, Final, Victory)
-        • Make it irresistibly clickable but not clickbait
-        • Maximum 60 characters for mobile optimization
-
-        SHORT DESCRIPTION FORMULA:
-        Line 1: Hook - What happened that's exciting/important
-        Line 2: Context - Why it matters specifically to this user
-        Line 3: Teaser - What they'll discover by reading (optional)
-
-        📊 SATISFACTION PREDICTION:
-        For each selected article, predict user satisfaction level:
-        🔥 PERFECT (95-100%): Exactly what they've been waiting for
-        ⭐ EXCELLENT (85-94%): Highly relevant and engaging
-        ✅ GOOD (75-84%): Solid match, will satisfy
-        ⚠️ FAIR (60-74%): Relevant but may disappoint
-
-        ONLY SELECT ARTICLES PREDICTED AT 85%+ SATISFACTION!
-
-        🎯 JSON RESPONSE FORMAT:
+        RESPONSE ([] if nothing meets 85%+):
         [
             {{
-                "article_id": 0,
-                "enhanced_title": "🏆 Asia Cup Final: India's Secret Weapon Against Pakistan Revealed!",
-                "short_description": "Coach Morkel drops bombshell hints about India's match-winning strategy just hours before the ultimate showdown. This could be the tactical masterclass that crushes Pakistan's World Cup dreams and delivers the victory you've been waiting for!",
-                "satisfaction_reason": "PERFECT match - Covers Asia Cup final with India vs Pakistan angle, includes strategic insights, directly relates to user's victory notification intent",
-                "predicted_satisfaction": "PERFECT - 98%",
-                "engagement_factors": ["Strategic insights", "India focus", "Victory potential", "Expert analysis"]
+                "article_id": <id>,
+                "enhanced_title": "<60 char>",
+                "short_description": "<2-3 lines>",
+                "satisfaction_reason": "<using ML scores + context>",
+                "predicted_satisfaction": "XX%",
+                "engagement_factors": ["<from ML + validation>"]
             }}
         ]
 
-        Remember: Quality over quantity. Better to return {target_count-1} perfect articles than {target_count} mediocre ones.
-        ONLY select articles that will make the user think "This is EXACTLY why I set up this alert!"
+        CRITICAL:
+        - ML did heavy lifting - validate context/semantics
+        - Return [] if no perfect match
+        - Max {target_count} articles
         """
 
         # Call Gemini for perfect filtering

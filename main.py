@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import logging
 import asyncio
 from contextlib import asynccontextmanager
@@ -61,6 +62,9 @@ app.include_router(notification_prefernces.router, prefix="/preferences", tags=[
 app.include_router(alerts.router, prefix="/alerts", tags=["Alerts"])
 app.include_router(rag_news_controller.router, prefix="/rag", tags=["RAG News Intelligence"])  # 👈 RAG system
 app.include_router(gatekeeper.router, prefix="/gatekeeper", tags=["Gatekeeper"])
+
+# Mount static files (for serving images)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 # Healthcheck
