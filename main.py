@@ -75,6 +75,6 @@ async def health_check():
 # Root
 @app.get("/")
 async def root():
-    return {"message": "Welcome to News App API naarad"}
+    return {"message": "Welcome to News App API naaaaaaarad"}
 
 
