@@ -173,7 +173,8 @@ def stop_news_scheduler():
 # RSS Feeds Configuration
 CATEGORY_RSS_FEEDS = {
     "sports": [
-        "w",
+        "https://www.thehindu.com/sport/feeder/default.rss",
+        "https://www.thehindu.com/sport/football/feeder/default.rss",
         "https://feeds.bbci.co.uk/sport/rss.xml",
         "https://rss.cnn.com/rss/edition_sport.rss"
     ],
@@ -200,8 +201,10 @@ CATEGORY_RSS_FEEDS = {
 async def fetch_rss_feed(url: str) -> List[Dict[str, Any]]:
     """Fetch and parse RSS feed"""
     try:
+        logger.info(f"🌐 Fetching RSS feed: {url}")
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(url)
+            logger.info(f"📡 RSS Response: {response.status_code} from {url}")
             if response.status_code == 200:
                 feed = feedparser.parse(response.content)
                 articles = []
@@ -757,24 +760,21 @@ def remove_obvious_spam_per_alert(articles: list, alert: dict) -> list:
             # STEP 4: Title relevance (titles are usually more focused)
             title_keyword_matches = sum(1 for kw in user_intent_keywords if kw in title)
 
-            # STEP 5: Strong ML-based filtering logic
-            # Prioritize RAG relevance score but validate with keyword matching
+            # STEP 5: Relaxed ML-based filtering - let Gemini do final filtering
+            # Accept if ANY relevance signal exists
             keep_article = False
 
-            # High confidence: Strong RAG score + keyword matches
-            if relevance_score > 0.5 and keyword_match_count >= 2:
+            # Very relaxed thresholds - accept if any signal is decent
+            if relevance_score > 0.2:  # Lowered from 0.5
                 keep_article = True
-            # Medium-high confidence: Good RAG score + some keyword matches
-            elif relevance_score > 0.4 and keyword_match_count >= 1:
+            # Accept if even 1 keyword matches
+            elif keyword_match_count >= 1:  # Lowered from 2
                 keep_article = True
-            # Title match: Keywords in title are strong signals
-            elif title_keyword_matches >= 2:
+            # Title match: Any keyword in title
+            elif title_keyword_matches >= 1:  # Lowered from 2
                 keep_article = True
-            # Moderate confidence: Decent overlap ratio
-            elif keyword_match_ratio >= 0.4 and relevance_score > 0.3:
-                keep_article = True
-            # Strong keyword presence even if lower RAG score
-            elif keyword_match_count >= 3:
+            # Accept low match ratio too
+            elif keyword_match_ratio >= 0.1:  # Lowered from 0.4
                 keep_article = True
 
             if keep_article:
@@ -1106,6 +1106,7 @@ async def final_gemini_perfect_filter(articles: list, user_alerts: list, target_
             # Add small delay for rate limiting
             await asyncio.sleep(0.5)
 
+            logger.info(f"🤖 Calling Gemini with {len(articles_for_analysis)} articles...")
             response = await client.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
                 headers={'Content-Type': 'application/json'},
@@ -1118,15 +1119,18 @@ async def final_gemini_perfect_filter(articles: list, user_alerts: list, target_
                 }
             )
 
+            logger.info(f"🤖 Gemini response status: {response.status_code}")
             if response.status_code == 200:
                 result = response.json()
                 ai_response = result['candidates'][0]['content']['parts'][0]['text']
+                logger.info(f"🤖 Gemini raw response: {ai_response[:500]}")
 
                 try:
                     # Extract JSON from response
                     json_match = re.search(r'\[.*\]', ai_response, re.DOTALL)
                     if json_match:
                         perfect_results = json.loads(json_match.group())
+                        logger.info(f"🤖 Gemini selected {len(perfect_results)} articles")
 
                         # Get ultra-enhanced articles with psychological intelligence
                         perfect_articles = []
@@ -1157,11 +1161,13 @@ async def final_gemini_perfect_filter(articles: list, user_alerts: list, target_
                         logger.info(f"Gemini perfect filter: {len(articles)} -> {len(perfect_articles)} articles")
                         return perfect_articles[:target_count]
 
-                except json.JSONDecodeError:
-                    logger.warning("Could not parse Gemini perfect filter response")
+                except json.JSONDecodeError as e:
+                    logger.error(f"❌ JSON parse error: {e} | Response: {ai_response[:200]}")
+                except Exception as e:
+                    logger.error(f"❌ Gemini parsing error: {e}")
 
             else:
-                logger.warning(f"Gemini perfect filter API error: {response.status_code}")
+                logger.error(f"❌ Gemini API error: {response.status_code} | {response.text[:200]}")
 
         # Fallback: return top articles by relevance score
         articles.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
@@ -1185,13 +1191,17 @@ async def get_alert_specific_articles(alert: dict, alert_query: str, category: s
         category_feeds = CATEGORY_RSS_FEEDS[category]
         category_articles = []
 
+        logger.info(f"📰 Fetching from {len(category_feeds)} RSS feeds for category: {category}")
         for feed_url in category_feeds:
             feed_articles = await fetch_rss_feed(feed_url)
+            logger.info(f"   ├─ {feed_url}: {len(feed_articles)} articles")
             for article in feed_articles:
                 article['category'] = category
                 category_articles.append(article)
 
+        logger.info(f"📊 Total articles fetched: {len(category_articles)}")
         if not category_articles:
+            logger.warning(f"⚠️ No articles found for category: {category}")
             return []
 
         # Step 2: Use existing RAG system's embedding model (memory efficient)
@@ -1201,16 +1211,19 @@ async def get_alert_specific_articles(alert: dict, alert_query: str, category: s
         # Generate query embedding
         query_embedding = model.encode(alert_query)
 
-        # Filter articles from last 24 hours only
+        # Filter articles from last 48 hours (relaxed window to handle timezone issues)
         from datetime import datetime, timezone, timedelta
         now = datetime.now(timezone.utc)
-        cutoff_time = now - timedelta(hours=24)
+        cutoff_time = now - timedelta(hours=48)  # Relaxed to 48 hours
+        logger.info(f"📅 Current UTC time: {now} | Cutoff: {cutoff_time}")
 
         recent_articles = []
         for article in category_articles:
             try:
                 # Parse published date
                 published_date_str = article.get('published_date', '')
+                article_title = article.get('title', '')[:50]
+
                 if published_date_str:
                     # Handle different date formats
                     try:
@@ -1221,38 +1234,70 @@ async def get_alert_specific_articles(alert: dict, alert_query: str, category: s
                         # Check if article is within last 24 hours
                         if published_date >= cutoff_time:
                             recent_articles.append(article)
-                    except:
+                            logger.info(f"   ✅ Date OK: '{article_title}' | {published_date_str}")
+                        else:
+                            logger.info(f"   ❌ Too old: '{article_title}' | {published_date_str}")
+                    except Exception as e:
                         # If date parsing fails, include the article (better to show than miss)
                         recent_articles.append(article)
+                        logger.info(f"   ⚠️ Date parse failed (INCLUDED): '{article_title}' | {published_date_str} | Error: {e}")
                 else:
                     # If no date, include the article
                     recent_articles.append(article)
-            except:
+                    logger.info(f"   ℹ️ No date (INCLUDED): '{article_title}'")
+            except Exception as e:
                 # If any error, include the article
                 recent_articles.append(article)
+                logger.info(f"   ❗ Exception (INCLUDED): '{article_title}' | {e}")
 
-        logger.info(f"24-hour filter: {len(category_articles)} -> {len(recent_articles)} recent articles")
+        logger.info(f"⏰ 24-hour filter: {len(category_articles)} -> {len(recent_articles)} recent articles")
 
-        # Generate embeddings for recent articles and calculate similarity
+        # HYBRID APPROACH: Combine semantic similarity + keyword matching
         scored_articles = []
+
+        # Extract key entities from alert query for keyword matching
+        import re
+        query_keywords = set(re.findall(r'\b\w{4,}\b', alert_query.lower()))
+        logger.info(f"🔍 Extracted {len(query_keywords)} keywords from query: {list(query_keywords)[:10]}")
+
         for article in recent_articles:
             article_text = f"{article.get('title', '')} {article.get('content', '')} {article.get('summary', '')}"
             article_embedding = model.encode(article_text)
 
-            # Calculate cosine similarity
+            # Calculate cosine similarity (semantic)
             import numpy as np
             similarity = np.dot(query_embedding, article_embedding) / (
                 np.linalg.norm(query_embedding) * np.linalg.norm(article_embedding)
             )
 
-            article['relevance_score'] = float(similarity)
-            if similarity > 0.1:  # Lowered threshold to catch more relevant articles
+            # Calculate keyword overlap score
+            article_text_lower = article_text.lower()
+            matched_keywords = [kw for kw in query_keywords if kw in article_text_lower]
+            keyword_score = len(matched_keywords) / max(len(query_keywords), 1) if query_keywords else 0
+
+            # Hybrid score: Balanced semantic + keyword matching
+            hybrid_score = (0.5 * similarity) + (0.5 * keyword_score)
+
+            article['relevance_score'] = float(hybrid_score)
+            article['semantic_score'] = float(similarity)
+            article['keyword_score'] = float(keyword_score)
+            article['matched_keywords'] = matched_keywords
+
+            # Very relaxed threshold - let articles through, filter later
+            # Accept if ANY of these conditions are met:
+            # 1. Decent hybrid score
+            # 2. Good keyword matching (at least 15% keywords match)
+            # 3. Decent semantic similarity
+            if hybrid_score > 0.05 or keyword_score > 0.15 or similarity > 0.1:
                 scored_articles.append(article)
+                logger.info(f"   ✅ MATCHED: '{article.get('title', '')[:60]}' | Hybrid:{hybrid_score:.3f} Keyword:{keyword_score:.3f} Semantic:{similarity:.3f}")
+            else:
+                logger.info(f"   ❌ REJECTED: '{article.get('title', '')[:60]}' | Hybrid:{hybrid_score:.3f} Keyword:{keyword_score:.3f} Semantic:{similarity:.3f}")
 
         # Step 3: Sort by relevance and return top articles
         scored_articles.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
 
-        logger.info(f"Alert-specific filtering: {len(category_articles)} -> {len(scored_articles)} relevant articles")
+        logger.info(f"🎯 Alert-specific filtering: {len(category_articles)} -> {len(scored_articles)} relevant articles")
         return scored_articles[:15]  # Return top 15 relevant articles
 
     except Exception as e:

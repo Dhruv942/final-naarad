@@ -268,8 +268,8 @@ class RAGSystem:
         self.gemini_api_key = gemini_api_key
         self.gemini_endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
-        # Initialize embedding model
-        self.embedding_model = SentenceTransformer("paraphrase-MiniLM-L3-v2")
+        # Initialize embedding model - Using L6-v2 for better semantic understanding
+        self.embedding_model = SentenceTransformer("paraphrase-MiniLM-L6-v2")
 
         # Initialize components
         self.vector_store = RAGVectorStore(
