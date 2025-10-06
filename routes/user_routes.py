@@ -74,27 +74,34 @@ async def send_welcome_message(country_code: str, phone_number: str):
 @router.post("/login", response_model=UserResponse)
 async def login_user(user: UserRegister):
 
+    # Check for existing user by phone number only (not email)
+    # This prevents duplicate users with same phone but different emails
     existing_user = await users_collection.find_one({
         "country_code": user.country_code,
-        "phone_number": user.phone_number,
-        "email": user.email,
-
+        "phone_number": user.phone_number
     })
 
     if existing_user:
-        # Send welcome message for existing user login
-        await send_welcome_message(user.country_code, user.phone_number)
+        # Update email if it has changed
+        if existing_user.get("email") != user.email:
+            await users_collection.update_one(
+                {"user_id": existing_user["user_id"]},
+                {"$set": {"email": user.email}}
+            )
+            logger.info(f"Updated email for user {existing_user['user_id']}: {user.email}")
+
+        # Don't send welcome message for existing users (only for new users)
+        logger.info(f"Existing user logged in: {existing_user['user_id']}")
 
         return UserResponse(
             user_id=existing_user["user_id"],
             country_code=existing_user["country_code"],
             phone_number=existing_user["phone_number"],
-            email=existing_user["email"],
-
+            email=user.email,  # Return the current email (updated or existing)
         )
 
     # Else create new user
-    new_user = user.dict()
+    new_user = user.model_dump()
     new_user["user_id"] = str(uuid.uuid4())
     await users_collection.insert_one(new_user)
 
