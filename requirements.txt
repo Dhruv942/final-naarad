@@ -1,12 +1,31 @@
- fastapi
-  uvicorn[standard]
-  motor
-  pymongo
-  pydantic
-  python-dotenv
-  feedparser
-  httpx
-  sentence-transformers
-  numpy
-  python-jose[cryptography]
-  pytz
+fastapi
+uvicorn[standard]
+motor
+pymongo
+pydantic
+python-dotenv
+feedparser
+httpx
+
+# AI/ML Libraries
+sentence-transformers>=2.2.0
+transformers>=4.30.0
+torch>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+
+# Google Generative AI
+google-generativeai>=0.3.0
+
+# Security
+python-jose[cryptography]
+
+# Utilities
+pytz
+
+# Google Search Integration (Optional - for augmenting RSS with search results)
+duckduckgo-search>=6.0.0  # Recommended: Free, no API key needed
+
+# Live Cricket Tracking
+beautifulsoup4>=4.12.0  # HTML parsing for Cricbuzz scraping
+lxml>=4.9.0  # Better HTML parser

@@ -9,7 +9,10 @@ from typing import List, Dict, Any
 import pytz
 
 from controllers.alerts_controller import get_scheduled_alerts, update_alert_last_sent
-from controllers.rag_news_controller import rag_system, send_wati_notification, fetch_all_news, get_alert_specific_articles, build_contextual_query, final_gemini_perfect_filter
+from controllers.rag_news_controller_refactored import rag_system, get_alert_specific_articles
+from services.rag_news.rss_fetcher import fetch_all_news
+from services.rag_news.article_filter import build_contextual_query
+from services.rag_news.gemini_service import final_gemini_perfect_filter
 from db.mongo import db
 
 logger = logging.getLogger(__name__)
@@ -212,8 +215,8 @@ class AlertScheduler:
                     "articles": [article]
                 }
 
-                # Send WhatsApp notification
-                wati_response = await send_wati_notification(user_id, alert_result)
+                # Send WhatsApp notification (disabled for testing)
+                wati_response = {"status": "skipped", "message": "WATI disabled in testing"}
                 logger.info(f"Scheduled alert notification sent: {wati_response.get('status', 'unknown')}")
 
                 # Add small delay between notifications
@@ -251,8 +254,8 @@ class AlertScheduler:
                     "articles": [article]
                 }
 
-                # Send WhatsApp notification
-                wati_response = await send_wati_notification(user_id, alert_result)
+                # Send WhatsApp notification (disabled for testing)
+                wati_response = {"status": "skipped", "message": "WATI disabled in testing"}
                 logger.info(f"One-time notification sent: {wati_response.get('status', 'unknown')}")
 
                 # Add small delay between notifications

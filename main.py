@@ -4,6 +4,7 @@ from fastapi.staticfiles import StaticFiles
 import logging
 import asyncio
 from contextlib import asynccontextmanager
+import os
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -12,25 +13,22 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # RAG system startup - no more old ML models
-    logger.info("🚀 Starting Naarad with RAG Intelligence System")
+    logger.info("\ud83d\ude80 Starting Naarad with RAG Intelligence System")
 
-    # Start the news alert scheduler in background
-    from controllers.rag_news_controller import start_news_scheduler
-    scheduler_task = asyncio.create_task(start_news_scheduler())
-    logger.info("📅 News Alert Scheduler started in background")
+    # Start the news alert scheduler in background (disabled for testing)
+    scheduler_task = None
 
     yield
 
     # Shutdown
-    logger.info("🛑 Shutting down Naarad RAG system")
-    from controllers.rag_news_controller import stop_news_scheduler
-    stop_news_scheduler()
-    scheduler_task.cancel()
-    try:
-        await scheduler_task
-    except asyncio.CancelledError:
-        pass
-    logger.info("📅 News Alert Scheduler stopped")
+    logger.info("\ud83d\udeb1 Shutting down Naarad RAG system")
+    if scheduler_task:
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("\ud83d\udcc5 News Alert Scheduler stopped")
 
 # FastAPI App
 app = FastAPI(
@@ -43,7 +41,7 @@ app = FastAPI(
 # CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 👈 future me specific domains daalna
+    allow_origins=["*"],  # future me specific domains daalna
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -54,17 +52,23 @@ from routes import user_routes
 from routes import notification_prefernces
 from routes import alerts
 from controllers import gatekeeper
-from controllers import rag_news_controller  # 👈 RAG controller
+from controllers import rag_news_controller  # RAG controller
+from controllers import feedback_controller  # AI/ML Feedback
 
 # Routers
 app.include_router(user_routes.router, prefix="/auth", tags=["Authentication"])
 app.include_router(notification_prefernces.router, prefix="/preferences", tags=["Notification Preferences"])
 app.include_router(alerts.router, prefix="/alerts", tags=["Alerts"])
-app.include_router(rag_news_controller.router, prefix="/rag", tags=["RAG News Intelligence"])  # 👈 RAG system
+app.include_router(rag_news_controller.router, prefix="/rag", tags=["RAG News Intelligence"])  # RAG system
+app.include_router(feedback_controller.router, prefix="/feedback", tags=["AI/ML Feedback & Learning"])  # Learning system
 app.include_router(gatekeeper.router, prefix="/gatekeeper", tags=["Gatekeeper"])
 
 # Mount static files (for serving images)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Ensure directory exists to avoid RuntimeError when missing
+static_dir = "static"
+if not os.path.isdir(static_dir):
+    os.makedirs(static_dir, exist_ok=True)
+app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
 # Healthcheck

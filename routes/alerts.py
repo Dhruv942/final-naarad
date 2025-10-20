@@ -93,7 +93,7 @@ async def set_one_time_schedule(user_id: str, alert_id: str, schedule_data: dict
     """
     from datetime import datetime
     import pytz
-    from controllers.rag_news_controller import get_user_news
+    from controllers.rag_news_controller_refactored import get_user_news
 
     try:
         # Parse scheduled datetime
