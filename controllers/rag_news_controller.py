@@ -1,201 +1,329 @@
-from fastapi import APIRouter
-from typing import Any, Dict, List
+from fastapi import APIRouter, HTTPException, Depends
+from typing import Dict, List, Any, Optional
 import logging
-
-from services.rag_news.pipeline import run_pipeline
-from services.rag_news.personalization import (
-    build_user_profile,
-    rerank_articles,
-    enforce_must_haves,
-)
-from services.rag_news.embeddings import get_embedder
-from services.rag_news.article_filter import build_contextual_query
-from services.rag_news.rss_fetcher import fetch_category_articles
-from db.mongo import alerts_collection, db
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qsl, urlencode
 import hashlib
-from datetime import datetime, timezone, timedelta
+import os
+
+from core.rag_system_enhanced import RAGSystem, Document, UserProfile, SentenceTransformerEmbedding
+from core.rag_pipeline import RAGPipeline, AlertPreference, Article, NewsFetcher, LLMClient
+from services.rag_news.google_search import search_google_news
+from services.rag_news.neural_reranker import NeuralReranker
+from services.rag_news.config import GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_CX
+from db.mongo import alerts_collection, db
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter()
 
+# Initialize RAG components
+embedding_model = SentenceTransformerEmbedding()
+rag_system = RAGSystem(
+    db=db,
+    embedding_model=embedding_model,
+    gemini_api_key=GEMINI_API_KEY
+)
+
+# Initialize LLM Client (use only gemini-2.5-flash)
+llm_client = LLMClient(api_key=GEMINI_API_KEY, model="gemini-2.5-flash")
+
+# Initialize News Fetcher
+news_fetcher = NewsFetcher()
+
+# Initialize RAG Pipeline
+rag_pipeline = RAGPipeline(
+    db=db,
+    llm_client=llm_client,
+    news_fetcher=news_fetcher  # Use NewsFetcher for fetching articles
+)
+
+# Initialize neural reranker
+neural_reranker = NeuralReranker()
+
+def _normalize_url(url: str) -> str:
+    """Normalize URL for deduplication."""
+    try:
+        if not url:
+            return ""
+        parsed = urlparse(url)
+        host = parsed.netloc.lower().lstrip('www.').lstrip('m.')
+        path = (parsed.path or "").rstrip("/").lower()
+        
+        # Keep only important query parameters
+        keep_params = {"id", "p", "v", "storyid", "article"}
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        filtered_query = [(k, v) for k, v in query if k.lower() in keep_params]
+        
+        # Rebuild URL
+        query_str = f"?{urlencode(filtered_query)}" if filtered_query else ""
+        return f"{host}{path}{query_str}"
+    except Exception:
+        return url or ""
+
+def _generate_fingerprint(url: str, title: str) -> str:
+    """Generate a fingerprint for deduplication."""
+    domain = (urlparse(url).netloc or "").lower().lstrip('www.').lstrip('m.')
+    title_lower = (title or "").strip().lower()
+    return hashlib.sha1(f"{domain}|{title_lower}".encode()).hexdigest()
+
+async def _is_duplicate(user_id: str, url: str, title: str, dedup_hours: int = 1) -> bool:
+    """Check if a news item has already been sent to the user."""
+    try:
+        coll = db.get_collection("sent_notifications")
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=dedup_hours)
+        
+        query = {
+            "user_id": user_id,
+            "created_at": {"$gte": cutoff.isoformat()},
+            "$or": [
+                {"url": _normalize_url(url)},
+                {"raw_url": url},
+                {"title_lower": (title or "").strip().lower()},
+                {"fp": _generate_fingerprint(url, title)}
+            ]
+        }
+        
+        return await coll.count_documents(query) > 0
+    except Exception as e:
+        logger.warning(f"Duplicate check failed: {e}")
+        return False
+
+async def _mark_as_sent(user_id: str, url: str, title: str, alert_id: str) -> None:
+    """Mark a news item as sent to the user."""
+    try:
+        coll = db.get_collection("sent_notifications")
+        doc = {
+            "user_id": user_id,
+            "url": _normalize_url(url),
+            "raw_url": url,
+            "title": title,
+            "title_lower": (title or "").strip().lower(),
+            "fp": _generate_fingerprint(url, title),
+            "alert_id": alert_id,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        await coll.update_one(
+            {"user_id": user_id, "url": doc["url"]},
+            {"$set": doc},
+            upsert=True
+        )
+    except Exception as e:
+        logger.warning(f"Failed to mark as sent: {e}")
 
 @router.get("/news/{user_id}")
-async def get_user_news(user_id: str):
-    try:
-        alerts = await alerts_collection.find({"user_id": user_id, "is_active": True}).to_list(None)
-        prefs = []
-        results = []
-        embedder = get_embedder()
+async def get_user_news(user_id: str) -> Dict[str, Any]:
+    """
+    Get personalized news for a user based on their alerts using the RAG pipeline.
+    
+    Args:
+        user_id: The ID of the user
         
-        def _normalize_url(u: str) -> str:
-            try:
-                if not u:
-                    return ""
-                p = urlparse(u)
-                host = p.netloc.lower()
-                if host.startswith("www."):
-                    host = host[4:]
-                if host.startswith("m."):
-                    host = host[2:]
-                path = (p.path or "").rstrip("/").lower()
-                keep = {"id", "p", "v", "storyid", "article", "amp"}
-                qs = [(k, v) for (k, v) in parse_qsl(p.query, keep_blank_values=True) if k.lower() in keep]
-                query = urlencode(qs)
-                key = f"{host}{path}"
-                if query:
-                    key = f"{key}?{query}"
-                return key
-            except Exception:
-                return u or ""
-
-        def _fingerprint(u: str, title: str) -> str:
-            d = (urlparse(u).netloc or "").lower()
-            if d.startswith("www."):
-                d = d[4:]
-            if d.startswith("m."):
-                d = d[2:]
-            tl = (title or "").strip().lower()
-            return hashlib.sha1(f"{d}|{tl}".encode("utf-8", errors="ignore")).hexdigest()
-
-        async def _already_sent(uid: str, url: str, title: str, dedup_hours: int = 48) -> bool:
-            try:
-                coll = db.get_collection("sent_notifications")
-                nurl = _normalize_url(url)
-                tl = (title or "").strip().lower()
-                fp = _fingerprint(url, title)
-                cutoff = datetime.now(timezone.utc) - timedelta(hours=dedup_hours)
-                cnt = await coll.count_documents({
-                    "user_id": uid,
-                    "created_at": {"$gte": cutoff.isoformat()},
-                    "$or": [
-                        {"url": nurl},
-                        {"url": url},
-                        {"title_lower": tl},
-                        {"fp": fp},
-                    ],
-                })
-                return cnt > 0
-            except Exception:
-                return False
-
-        async def _mark_sent(uid: str, url: str, title: str, alert_id: str):
-            try:
-                coll = db.get_collection("sent_notifications")
-                nurl = _normalize_url(url)
-                tl = (title or "").strip().lower()
-                fp = _fingerprint(url, title)
-                doc = {
-                    "user_id": uid,
-                    "url": nurl,
-                    "raw_url": url,
-                    "title": title,
-                    "title_lower": tl,
-                    "fp": fp,
-                    "alert_id": alert_id,
-                    "channel": "api",
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                }
-                await coll.update_one({"user_id": uid, "url": nurl}, {"$set": doc}, upsert=True)
-            except Exception as e:
-                logger.warning(f"Mark sent failed: {e}")
-
-        for a in alerts:
-            cat = (a.get("main_category", "") or "").lower()
-            kws = a.get("sub_categories", []) or []
-            fus = a.get("followup_questions", []) or []
-            cq = a.get("custom_question", "") or ""
-            ctx_q = await build_contextual_query(a, kws, fus, cq, cat)
-            prefs.append({
-                "alert_id": str(a.get("_id")),
-                "category": cat,
-                "sub_categories": kws,
-                "followup_questions": fus,
-                "custom_question": cq,
-                "contextual_query": ctx_q,
-            })
-
-            # Fetch articles from RSS + optionally Google Search
-            # Pass keywords to enable targeted search
-            search_keywords = kws + fus  # Combine sub_categories + followup_questions
-            articles = await fetch_category_articles(cat, keywords=search_keywords)
-            ranked = await run_pipeline(a, articles, embedder)
-            # Personalization: build profile from alert and rerank
-            profile = build_user_profile(a, user_id)
-            personalized = rerank_articles(ranked, profile, ctx_q)
-            personalized = enforce_must_haves(personalized, profile)
+    Returns:
+        Dict containing the news results
+    """
+    try:
+        # Get user's active alerts from alerts collection
+        print(f"\n=== DEBUG: Fetching alerts for user {user_id} ===")
+        
+        # First check if we have any active alerts for this user
+        alerts_count = await alerts_collection.count_documents({
+            "user_id": user_id,
+            "is_active": True
+        })
+        
+        print(f"Found {alerts_count} active alerts for user")
+        
+        if alerts_count == 0:
+            print("No active alerts found for user")
+            return {
+                "status": "success",
+                "user_id": user_id,
+                "alerts_processed": 0,
+                "results": [],
+                "message": "No active alerts found for user"
+            }
             
-            # Persistent dedup: filter out items already sent to this user within dedup_hours window
-            aid = str(a.get("_id"))
-            dedup_hours = int(a.get("dedup_hours", 48))
-            not_sent = []
-            deduped_count = 0
-            for it in personalized:
-                url = it.get("url", "")
-                title = it.get("title", "")
-                if not await _already_sent(user_id, url, title, dedup_hours):
-                    not_sent.append(it)
-                else:
-                    deduped_count += 1
-                    logger.debug(f"   ⏭️  Deduped (already sent): {title[:50]}...")
-            
-            if deduped_count > 0:
-                logger.info(f"⏭️  Deduplicated {deduped_count} articles (already sent within {dedup_hours}h)")
-            
-            # In-response dedup by normalized URL, raw URL, title_lower, and fingerprint
-            seen = set()
-            unique_ranked = []
-            for it in not_sent:
-                url = it.get("url", "")
-                tl = (it.get("title", "") or "").strip().lower()
-                nurl = _normalize_url(url)
-                fp = _fingerprint(url, tl)
-                keys = [f"u:{url}", f"n:{nurl}", f"t:{tl}", f"f:{fp}"]
-                if any(k in seen for k in keys):
+        # Get all active alerts for processing
+        alerts = await alerts_collection.find({
+            "user_id": user_id,
+            "is_active": True
+        }).to_list(None)
+        
+        all_articles = []
+        
+        for alert in alerts:
+            try:
+                alert_id = str(alert["_id"])
+                
+                # Debug print alert data
+                print(f"\n=== Processing Alert {alert_id} ===")
+                print(f"Alert data: {alert}")
+                
+                # Create AlertPreference from alert
+                preference = AlertPreference(
+                    user_id=user_id,
+                    alert_id=alert_id,
+                    category=alert.get("main_category", ""),  # Use main_category as category
+                    sub_categories=alert.get("sub_categories", []),
+                    followup_questions=alert.get("followup_questions", []),
+                    custom_question=alert.get("custom_question", "")
+                )
+                
+                print(f"Created AlertPreference: {preference}")
+
+                # Merge parsed preferences from alertspars (if available)
+                try:
+                    parsed = await db.get_collection("alertspars").find_one({"alert_id": alert_id})
+                    if parsed:
+                        # contextual_query
+                        cq = parsed.get("contextual_query")
+                        if isinstance(cq, str) and cq.strip():
+                            preference.contextual_query = cq.strip()
+                        # canonical_entities
+                        ce = parsed.get("canonical_entities")
+                        if isinstance(ce, list):
+                            preference.canonical_entities = [str(x) for x in ce if x is not None]
+                        # event_conditions (coerce to strings if objects)
+                        ec = parsed.get("event_conditions")
+                        if isinstance(ec, list):
+                            preference.event_conditions = [
+                                (e if isinstance(e, str) else str(e)) for e in ec if e is not None
+                            ]
+                        # forbidden_topics
+                        ft = parsed.get("forbidden_topics")
+                        if isinstance(ft, list):
+                            preference.forbidden_topics = [str(x) for x in ft if x is not None]
+                        # trusted fields
+                        ts = parsed.get("trusted_sources")
+                        if isinstance(ts, list):
+                            preference.trusted_sources = [str(x) for x in ts if x]
+                        tq = parsed.get("trusted_queries")
+                        if isinstance(tq, list):
+                            preference.trusted_queries = [str(x) for x in tq if x]
+                        ct = parsed.get("custom_triggers")
+                        if isinstance(ct, list):
+                            preference.custom_triggers = [str(x) for x in ct if x]
+                        tg = parsed.get("tags")
+                        if isinstance(tg, list):
+                            preference.tags = [str(x) for x in tg if x]
+                        print("Merged alertspars into preference (contextual_query/entities/conditions/topics/trusted)")
+                except Exception as merge_err:
+                    logger.warning(f"Failed to merge alertspars for alert {alert_id}: {merge_err}")
+                
+                # Process alert through RAG pipeline
+                print("Processing alert through RAG pipeline...")
+                try:
+                    # Convert AlertPreference to dict before processing
+                    alert_dict = preference.dict()
+                    results = await rag_pipeline.process_alert(alert_dict)
+                    
+                    # Check if we got results
+                    if results.get('status') == 'no_articles':
+                        print(f"No articles found for alert {alert_id}")
+                        continue
+                    
+                    articles_list = results.get('articles', [])
+                    print(f"RAG pipeline returned {len(articles_list)} articles")
+                    
+                except Exception as e:
+                    print(f"Error in RAG pipeline: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
                     continue
-                for k in keys:
-                    seen.add(k)
-                # annotate
-                it2 = dict(it)
-                it2["title_lower"] = tl
-                it2["url_normalized"] = nurl
-                it2["fp"] = fp
-                unique_ranked.append(it2)
-            
-            # Log which articles are from Google Search
-            google_count = sum(1 for art in unique_ranked if art.get("from_google_search", False))
-            rss_count = len(unique_ranked) - google_count
-            
-            if len(unique_ranked) == 0:
-                logger.warning(f"⚠️  Final Selection: 0 articles (all {len(personalized)} articles were deduplicated or filtered)")
-            elif google_count > 0:
-                logger.info(f"📊 Final Selection: {len(unique_ranked)} articles ({rss_count} RSS, {google_count} Google Search)")
-                logger.info("🔍 Google Search articles in final results:")
-                for i, art in enumerate(unique_ranked, 1):
-                    if art.get("from_google_search", False):
-                        logger.info(f"   {i}. {art.get('title', '')[:60]}... (Score: {art.get('final_score', 0):.3f})")
-            else:
-                logger.info(f"📊 Final Selection: {len(unique_ranked)} articles (all from RSS)")
-            
-            # Mark returned items as sent for future dedup
-            for it in unique_ranked:
-                await _mark_sent(user_id, it.get("url", ""), it.get("title", ""), aid)
-            results.append({
-                "alert_id": str(a.get("_id")),
-                "category": cat,
-                "contextual_query": ctx_q,
-                "returned": len(unique_ranked),
-                "articles": unique_ranked,
-            })
+                
+                # Process and deduplicate articles
+                processed_articles = []
+                seen_urls = set()
+                
+                for article_dict in articles_list:
+                    # Convert dict to Article object or access as dict
+                    if isinstance(article_dict, dict):
+                        url = article_dict.get('url')
+                        title = article_dict.get('title')
+                        source = article_dict.get('source', '')
+                        published_at = article_dict.get('published_at')
+                        content = article_dict.get('content', '')
+                    else:
+                        # It's an Article object
+                        url = article_dict.url
+                        title = article_dict.title
+                        source = article_dict.source or ''
+                        published_at = article_dict.published_at
+                        content = article_dict.content
+                    
+                    if not url or not title:
+                        continue
+                        
+                    normalized_url = _normalize_url(url)
+                    fingerprint = _generate_fingerprint(normalized_url, title.lower())
+                    
+                    if fingerprint in seen_urls or await _is_duplicate(user_id, normalized_url, title):
+                        continue
+                        
+                    seen_urls.add(fingerprint)
+                    
+                    # Mark as sent to avoid duplicates
+                    await _mark_as_sent(user_id, normalized_url, title, alert_id)
+                    
+                    processed_articles.append({
+                        "title": title,
+                        "url": url,
+                        "source": source,
+                        "published_date": published_at.isoformat() if published_at else "",
+                        "snippet": content[:200] if content else "",
+                        "alert_id": alert_id,
+                        "category": preference.category,
+                        "keywords": preference.sub_categories,
+                        "tags": getattr(preference, "tags", []),
+                        "relevance_score": float((article_dict.get('relevance_score') if isinstance(article_dict, dict) else getattr(article_dict, 'relevance_score', 0)) or 0)
+                    })
+                
+                if not processed_articles and articles_list:
+                    fallback = []
+                    for ad in (articles_list[:5] if isinstance(articles_list, list) else []):
+                        if isinstance(ad, dict):
+                            fu = ad.get('url')
+                            ft = ad.get('title')
+                            fs = ad.get('source', '')
+                            fp = ad.get('published_at')
+                            fc = ad.get('content', '')
+                            if fu and ft:
+                                fallback.append({
+                                    "title": ft,
+                                    "url": fu,
+                                    "source": fs,
+                                    "published_date": fp if isinstance(fp, str) else (fp.isoformat() if fp else ""),
+                                    "snippet": fc[:200] if fc else "",
+                                    "alert_id": alert_id,
+                                    "category": preference.category,
+                                    "keywords": preference.sub_categories,
+                                    "tags": getattr(preference, "tags", []),
+                                    "relevance_score": 0.0
+                                })
+                    processed_articles.extend(fallback)
 
+                all_articles.extend(processed_articles)
+                
+                # Update user profile with interaction (if articles were found)
+                if articles_list:
+                    query_text = preference.contextual_query or preference.custom_question or " ".join(preference.sub_categories)
+                    # Note: record_search_interaction expects Document objects, skipping for now
+                    # Can be implemented later when needed
+                
+            except Exception as e:
+                logger.error(f"Error processing alert {alert.get('_id')}: {str(e)}", exc_info=True)
+                continue
+        
+        # Sort articles by relevance score in descending order (handle None safely)
+        all_articles.sort(key=lambda x: float(x.get("relevance_score") or 0), reverse=True)
+        
         return {
             "status": "success",
             "user_id": user_id,
-            "alerts_count": len(alerts),
-            "preferences": prefs,
-            "alert_results": results,
+            "alerts_processed": len(alerts),
+            "results": all_articles
         }
+        
     except Exception as e:
-        logger.error(f"Failed to load user news prefs: {e}")
-        return {"status": "error", "message": str(e)}
+        logger.error(f"Error in get_user_news for user {user_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

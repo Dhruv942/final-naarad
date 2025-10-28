@@ -54,6 +54,7 @@ from routes import alerts
 from controllers import gatekeeper
 from controllers import rag_news_controller  # RAG controller
 from controllers import feedback_controller  # AI/ML Feedback
+from controllers import news_pipeline_controller  # 3-Stage LLM Pipeline
 
 # Routers
 app.include_router(user_routes.router, prefix="/auth", tags=["Authentication"])
@@ -62,6 +63,7 @@ app.include_router(alerts.router, prefix="/alerts", tags=["Alerts"])
 app.include_router(rag_news_controller.router, prefix="/rag", tags=["RAG News Intelligence"])  # RAG system
 app.include_router(feedback_controller.router, prefix="/feedback", tags=["AI/ML Feedback & Learning"])  # Learning system
 app.include_router(gatekeeper.router, prefix="/gatekeeper", tags=["Gatekeeper"])
+app.include_router(news_pipeline_controller.router, prefix="/pipeline", tags=["News Pipeline"])  # 3-Stage Pipeline
 
 # Mount static files (for serving images)
 # Ensure directory exists to avoid RuntimeError when missing

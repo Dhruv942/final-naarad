@@ -19,7 +19,11 @@ feed_collection = db.get_collection("feeds")
 personalized_collection = db.get_collection("personalized_news")
 
 # RAG-specific collections
+alertsparse_collection = db.get_collection("alertsparse")
 document_vectors_collection = db.get_collection("document_vectors")
 user_profiles_collection = db.get_collection("user_profiles")
 user_interactions_collection = db.get_collection("user_interactions")
 user_feedback_collection = db.get_collection("user_feedback")
+
+# Notification queue for personalized news pipeline
+notification_queue_collection = db.get_collection("notification_queue")

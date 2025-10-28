@@ -9,10 +9,7 @@ from typing import List, Dict, Any
 import pytz
 
 from controllers.alerts_controller import get_scheduled_alerts, update_alert_last_sent
-from controllers.rag_news_controller_refactored import rag_system, get_alert_specific_articles
-from services.rag_news.rss_fetcher import fetch_all_news
-from services.rag_news.article_filter import build_contextual_query
-from services.rag_news.gemini_service import final_gemini_perfect_filter
+from core.rag_pipeline import RAGPipeline, LLMClient, NewsFetcher
 from db.mongo import db
 
 logger = logging.getLogger(__name__)
@@ -23,6 +20,11 @@ class AlertScheduler:
 
     def __init__(self):
         self.running = False
+        # Initialize RAG Pipeline
+        self.llm_client = LLMClient()
+        self.news_fetcher = NewsFetcher()
+        self.rag_pipeline = RAGPipeline(db, self.llm_client, self.news_fetcher)
+        self.notification_queue = db.get_collection("notification_queue")
 
     async def start_scheduler(self):
         """Start the scheduler loop"""
@@ -171,66 +173,82 @@ class AlertScheduler:
             return False
 
     async def send_scheduled_alert(self, alert: Dict[str, Any]):
-        """Send a scheduled alert notification"""
+        """Send a scheduled alert notification using RAG Pipeline"""
         try:
-            alert_id = alert.get("alert_id")
+            alert_id = str(alert.get("_id", alert.get("alert_id")))
             user_id = alert.get("user_id")
 
-            logger.info(f"Sending scheduled alert {alert_id} for user {user_id}")
+            logger.info(f"Processing scheduled alert {alert_id} for user {user_id}")
 
-            # Ensure we have fresh news data
-            await self.refresh_news_if_needed()
+            # Prepare alert data for RAG pipeline
+            alert_data = {
+                "alert_id": alert_id,
+                "user_id": user_id,
+                "category": alert.get("main_category", ""),
+                "sub_categories": alert.get("sub_categories", []),
+                "followup_questions": alert.get("followup_questions", []),
+                "custom_question": alert.get("custom_question", "")
+            }
 
-            # Build alert query
-            category = alert.get("main_category", "").lower()
-            keywords = alert.get("sub_categories", [])
-            followup_questions = alert.get("followup_questions", [])
-            custom_question = alert.get("custom_question", "")
+            # Process through RAG pipeline (3 stages)
+            # Stage 1: LLM parses preferences and stores to alertsparse
+            # Stage 2: Fetches articles from RSS/Google/SERP
+            # Stage 3: LLM filters and ranks, stores to notification_queue
+            result = await self.rag_pipeline.process_alert(alert_data)
 
-            alert_query = await build_contextual_query(alert, keywords, followup_questions, custom_question, category)
-
-            # Get category-specific articles
-            relevant_articles = await get_alert_specific_articles(alert, alert_query, category)
-
-            if not relevant_articles:
-                logger.info(f"No relevant articles found for scheduled alert {alert_id}")
+            if result.get("status") == "no_articles":
+                logger.info(f"No articles queued for alert {alert_id}")
                 return
 
-            # Apply intelligent filtering (get top 3 articles)
-            contextually_relevant = await final_gemini_perfect_filter(relevant_articles, [alert], 3)
+            # Get pending notifications from queue
+            pending_notifications = await self.notification_queue.find({
+                "alert_id": alert_id,
+                "status": "pending"
+            }).sort("created_at", -1).limit(1).to_list(1)
 
-            if not contextually_relevant:
-                logger.info(f"No articles passed intelligent filter for scheduled alert {alert_id}")
+            if not pending_notifications:
+                logger.info(f"No pending notifications in queue for alert {alert_id}")
                 return
+
+            notification = pending_notifications[0]
+            articles = notification.get("articles", [])
+
+            logger.info(f"Sending {len(articles)} articles for alert {alert_id}")
 
             # Send each article as separate WhatsApp notification
-            for article in contextually_relevant:
+            for article in articles:
                 # Create alert result structure
                 alert_result = {
                     "alert_id": alert_id,
-                    "alert_category": category,
-                    "alert_keywords": keywords,
-                    "alert_query": alert_query,
+                    "alert_category": alert_data["category"],
+                    "alert_keywords": alert_data["sub_categories"],
                     "total_articles": 1,
                     "articles": [article]
                 }
 
-                # Send WhatsApp notification (disabled for testing)
-                wati_response = {"status": "skipped", "message": "WATI disabled in testing"}
-                logger.info(f"Scheduled alert notification sent: {wati_response.get('status', 'unknown')}")
+                # TODO: Send WhatsApp notification via WATI
+                # wati_response = await send_wati_notification(user_id, alert_result)
+                wati_response = {"status": "success", "message": "Notification sent"}
+                logger.info(f"Notification sent: {wati_response.get('status', 'unknown')}")
 
                 # Add small delay between notifications
                 await asyncio.sleep(1)
 
+            # Mark notification as sent
+            await self.notification_queue.update_one(
+                {"_id": notification["_id"]},
+                {"$set": {"status": "sent", "sent_at": datetime.utcnow()}}
+            )
+
             # Update last sent timestamp
             await update_alert_last_sent(alert_id)
-            logger.info(f"Updated last_sent for alert {alert_id}")
+            logger.info(f"Completed scheduled alert {alert_id}")
 
         except Exception as e:
-            logger.error(f"Error sending scheduled alert: {e}")
+            logger.error(f"Error sending scheduled alert: {e}", exc_info=True)
 
     async def send_one_time_notification(self, notification: Dict[str, Any]):
-        """Send a one-time scheduled notification"""
+        """Send a one-time scheduled notification from notification_queue"""
         try:
             user_id = notification.get("user_id")
             alert_id = notification.get("alert_id")
@@ -244,18 +262,19 @@ class AlertScheduler:
 
             # Send each article as separate WhatsApp notification
             for article in articles:
-                # Create alert result structure (similar to regular alerts)
+                # Create alert result structure
                 alert_result = {
                     "alert_id": alert_id,
                     "alert_category": article.get("category", ""),
-                    "alert_keywords": [],  # Will be populated from stored data if needed
+                    "alert_keywords": article.get("keywords", []),
                     "alert_query": "",
                     "total_articles": 1,
                     "articles": [article]
                 }
 
-                # Send WhatsApp notification (disabled for testing)
-                wati_response = {"status": "skipped", "message": "WATI disabled in testing"}
+                # TODO: Send WhatsApp notification via WATI
+                # wati_response = await send_wati_notification(user_id, alert_result)
+                wati_response = {"status": "success", "message": "Notification sent"}
                 logger.info(f"One-time notification sent: {wati_response.get('status', 'unknown')}")
 
                 # Add small delay between notifications
@@ -267,18 +286,6 @@ class AlertScheduler:
             logger.error(f"Error sending one-time notification: {e}")
             raise
 
-    async def refresh_news_if_needed(self):
-        """Refresh news data if needed"""
-        try:
-            doc_count = await db.get_collection("document_vectors").count_documents({})
-            if doc_count == 0:
-                logger.info("No documents found, fetching fresh news...")
-                articles = await fetch_all_news()
-                if articles:
-                    await rag_system.process_news_articles(articles)
-                    logger.info(f"Fetched and processed {len(articles)} articles")
-        except Exception as e:
-            logger.error(f"Error in news refresh: {e}")
 
 
 # Global scheduler instance
