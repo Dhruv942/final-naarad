@@ -8,6 +8,7 @@ It handles API calls, rate limiting, and result formatting.
 import os
 import json
 import time
+import asyncio
 import logging
 import requests
 from typing import List, Dict, Any, Optional
@@ -43,7 +44,7 @@ class GoogleNewsSearch:
         self,
         query: str,
         num_results: int = 10,
-        days_back: int = 7,
+        days_back: int = 1,
         language: str = "en",
         region: str = "us"
     ) -> List[Dict[str, Any]]:
@@ -160,7 +161,7 @@ def get_google_news_search(api_key: str = None, cx: str = None) -> GoogleNewsSea
 async def search_google_news(
     query: str,
     num_results: int = 10,
-    days_back: int = 7,
+    days_back: int = 1,
     language: str = "en",
     region: str = "us"
 ) -> List[Dict[str, Any]]:

@@ -1,6 +1,7 @@
 from urllib.parse import urlparse
 from services.rag_news.google_search import search_google_news
 from services.rag_news.config import build_trusted_query, get_trusted_sport_sources
+from services.rag_news.news_gatekeeper import NewsGatekeeper
 """
 RAG Pipeline Implementation with Three Stages:
 1. Preference Parsing (LLM)
@@ -10,6 +11,7 @@ RAG Pipeline Implementation with Three Stages:
 
 import asyncio
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
@@ -66,10 +68,11 @@ class RAGPipeline:
         self.db = db
         self.llm = llm_client
         self.news_fetcher = news_fetcher
+        self.gatekeeper = NewsGatekeeper(llm_client)  # Initialize gatekeeper
         self.alerts_collection = db.get_collection("alertspars")
         self.articles_collection = db.get_collection("articles")
         self.notification_queue = db.get_collection("notification_queue")
-        
+
         # Ensure indexes
         self._ensure_indexes()
     
@@ -104,13 +107,42 @@ class RAGPipeline:
         Returns:
             Dict containing the processing results
         """
-        # Stage 1: Parse and store alert preferences
+        # Stage 1: Parse and store alert preferences FIRST
         parsed_alert = await self._parse_alert_preferences(alert_data)
         
-        # Stage 2: Fetch relevant articles
+        # NEW: Check for pending articles from previous cron
+        pending_articles = await self._get_and_clear_pending_articles(
+            alert_data.get("alert_id"),
+            alert_data.get("user_id")
+        )
+        
+        # ALWAYS fetch fresh articles (don't skip even if pending exist)
         articles = await self._fetch_articles(parsed_alert)
         
-        # Stage 3: Filter and rank articles
+        # If we have pending articles, merge them with fresh ones
+        if pending_articles:
+            logger.info(f"Found {len(pending_articles)} pending articles from previous cron - merging with fresh articles")
+            
+            # Convert pending to Article objects
+            for p in pending_articles:
+                try:
+                    art = Article(
+                        id=str(uuid.uuid4()),
+                        title=p.get("title", ""),
+                        content=p.get("content", ""),
+                        url=p.get("url", ""),
+                        source=p.get("source", ""),
+                        published_at=p.get("published_at"),
+                        category=p.get("category", parsed_alert.category),
+                        metadata=p.get("metadata", {})
+                    )
+                    # Avoid duplicates by URL
+                    if art.url and art.url not in [a.url for a in articles]:
+                        articles.append(art)
+                except Exception as e:
+                    logger.warning(f"Error converting pending article: {e}")
+        
+        # Stage 3: Filter and rank articles (includes both fresh and pending merged)
         results = await self._filter_and_rank_articles(parsed_alert, articles)
         
         # Store and return results
@@ -152,10 +184,13 @@ class RAGPipeline:
                 event_conditions=parsed_data.get("event_conditions", []),
                 forbidden_topics=parsed_data.get("forbidden_topics", []),
                 trusted_sources=alert_data.get("trusted_sources", []),
-                trusted_queries=alert_data.get("trusted_queries", []),
+                # Use LLM-generated trusted_queries if available, otherwise use existing
+                trusted_queries=parsed_data.get("trusted_queries", []) or alert_data.get("trusted_queries", []),
                 custom_triggers=alert_data.get("custom_triggers", []),
                 tags=parsed_data.get("tags", [])
             )
+            
+            logger.info(f"Stage1 Parsed -> trusted_queries={alert_pref.trusted_queries}")
             
             # Store in database using Pydantic's .dict() method
             await self.alerts_collection.update_one(
@@ -195,28 +230,32 @@ class RAGPipeline:
     
     def _build_preference_parsing_prompt(self, alert_data: Dict[str, Any]) -> str:
         """Build the prompt for the LLM to parse alert preferences"""
-        return f"""
-        Parse the following user alert into structured data:
-        
-        Category: {alert_data.get('category', '')}
-        Sub-categories: {', '.join(alert_data.get('sub_categories', []))}
-        Follow-up questions: {', '.join(alert_data.get('followup_questions', []))}
-        Custom question: {alert_data.get('custom_question', '')}
-        
-        Extract the following:
-        1. Canonical entities (main people, places, organizations, etc.)
-        2. Event conditions (specific events, timeframes, or conditions)
-        3. Contextual query (expanded search terms)
-        4. Forbidden topics (topics to exclude)
-        
-        Return as a JSON object with these fields:
-        {{
-            "canonical_entities": ["entity1", "entity2", ...],
-            "event_conditions": ["condition1", "condition2", ...],
-            "contextual_query": "expanded search query with synonyms",
-            "forbidden_topics": ["topic1", "topic2", ...]
-        }}
-        """
+        return f"""Parse this alert and create search queries:
+
+Category: {alert_data.get('category', '')}
+Custom question: {alert_data.get('custom_question', '')}
+Follow-up: {', '.join(alert_data.get('followup_questions', []))}
+
+RULES:
+1. Extract entities (e.g., "Yes Bank", "US Dollar")
+2. Create ONE search query per entity (keep it simple, max 6 words)
+3. For "price" requests → search for actual exchange rates/stock prices
+4. Add "today" to queries for freshness
+
+Return JSON:
+{{
+  "canonical_entities": ["entity1", "entity2"],
+  "event_conditions": ["daily", "updates"],
+  "contextual_query": "combined search terms",
+  "forbidden_topics": [],
+  "trusted_queries": ["entity1 search query", "entity2 search query"]
+}}
+
+Example: "dollar price and Yes Bank stock" →
+{{
+  "canonical_entities": ["US Dollar", "Yes Bank"],
+  "trusted_queries": ["dollar to rupee today", "Yes Bank stock price today"]
+}}"""
     
     def _parse_llm_response(self, response: str) -> Dict[str, Any]:
         """Parse the LLM response into structured data"""
@@ -307,14 +346,59 @@ class RAGPipeline:
                         q = build_trusted_query(sport, str(ent).strip())
                         if q:
                             derived_trusted_queries.append(q)
+                # General categories: build simple entity+category queries (no site restriction)
+                if not derived_trusted_queries:
+                    entities = [str(e).strip() for e in (alert.canonical_entities or []) if str(e).strip()]
+                    if not entities:
+                        entities = [str(fq).strip() for fq in (alert.followup_questions or []) if fq and any(c.isalpha() for c in fq)]
+                    base_terms = []
+                    cat_lower = (alert.category or "").lower()
+                    if cat_lower in ["movies", "entertainment"]:
+                        base_terms = ["release date", "trailer", "cast", "streaming", "OTT"]
+                    elif cat_lower in ["technology", "business", "world", "science", "health"]:
+                        base_terms = ["latest", "today", "update"]
+                    else:
+                        base_terms = ["latest", "today"]
+                    # Build queries
+                    for ent in entities[:4]:
+                        # quoted entity for precise matching
+                        ent_q = f'"{ent}"' if (" " in ent) else ent
+                        # Always include category token if present
+                        if cat_lower:
+                            derived_trusted_queries.append(f"{ent_q} {cat_lower}")
+                        for term in base_terms:
+                            derived_trusted_queries.append(f"{ent_q} {term}")
+                    # De-dup and cap
+                    seen_q = set()
+                    uniq: List[str] = []
+                    for q in derived_trusted_queries:
+                        qq = q.strip().lower()
+                        if qq and qq not in seen_q:
+                            seen_q.add(qq)
+                            uniq.append(q.strip())
+                    derived_trusted_queries = uniq[:6]
 
             effective_trusted = alert.trusted_queries or derived_trusted_queries
             effective_sources = alert.trusted_sources or derived_trusted_sources
 
+            logger.info(f"Stage2 Retrieval -> Using {len(effective_trusted)} trusted queries: {effective_trusted}")
+
             if effective_trusted:
                 for tq in effective_trusted[:5]:
                     try:
-                        g_items = await search_google_news(tq, num_results=5, days_back=7, language="en", region="in")
+                        logger.info(f"Stage2 Retrieval -> Searching: '{tq}'")
+                        # Category-based recency window: sports=1d, movies/entertainment=7d, business/tech=3d, default=3d
+                        cat_l = (alert.category or "").lower()
+                        if cat_l == "cricket" or cat_l == "sports":
+                            days_back_val = 1
+                        elif cat_l in ["movies", "entertainment"]:
+                            days_back_val = 7
+                        elif cat_l in ["business", "technology", "tech"]:
+                            days_back_val = 3
+                        else:
+                            days_back_val = 3
+                        g_items = await search_google_news(tq, num_results=5, days_back=days_back_val, language="en", region="in")
+                        logger.info(f"Stage2 Retrieval -> Got {len(g_items)} results for: '{tq}'")
                         for item in g_items:
                             u = item.get("url")
                             if not u or u in seen_urls:
@@ -337,41 +421,58 @@ class RAGPipeline:
                                 ))
                             except Exception as e:
                                 logger.error(f"Error creating article from trusted query: {e}")
-                        # Also try Google News RSS via NewsFetcher for the same trusted query
-                        try:
-                            rss_items = await self.news_fetcher.fetch("google_news", tq, category=alert.category)
-                            for ad in rss_items:
-                                u2 = ad.get("url")
-                                if not u2 or u2 in seen_urls:
-                                    continue
-                                if effective_sources:
-                                    host2 = urlparse(u2).netloc.lower()
-                                    if not any(src in host2 for src in effective_sources):
+                        # Also try Google News RSS via NewsFetcher for the same trusted query (skip if live intent for speed)
+                        if not has_live_intent:
+                            try:
+                                rss_items = await self.news_fetcher.fetch("google_news", tq, category=alert.category)
+                                for ad in rss_items:
+                                    u2 = ad.get("url")
+                                    if not u2 or u2 in seen_urls:
                                         continue
-                                seen_urls.add(u2)
-                                try:
-                                    articles.append(Article(
-                                        id=u2,
-                                        title=ad.get("title", ""),
-                                        content=ad.get("content", ""),
-                                        url=u2,
-                                        source=ad.get("source", "unknown"),
-                                        published_at=(ad.get("published_at") or ad.get("published_date") or datetime.now(timezone.utc)),
-                                        category=ad.get("category", alert.category),
-                                        metadata=ad.get("metadata", {})
-                                    ))
-                                except Exception as e:
-                                    logger.error(f"Error creating article from trusted RSS: {e}")
-                        except Exception as e:
-                            logger.warning(f"Trusted RSS search failed: {e}")
+                                    if effective_sources:
+                                        host2 = urlparse(u2).netloc.lower()
+                                        if not any(src in host2 for src in effective_sources):
+                                            continue
+                                    seen_urls.add(u2)
+                                    try:
+                                        meta = ad.get("metadata", {}) or {}
+                                        spd = ad.get("scraped_published_date")
+                                        if spd is not None:
+                                            meta["scraped_published_date"] = spd
+                                        # Propagate image from RSS result if available
+                                        img = ad.get("image") or ad.get("image_url") or ""
+                                        if img:
+                                            meta["image"] = img
+                                            meta["image_url"] = img
+                                        # Prefer scraped_published_date for published_at when available
+                                        pref_pub = spd if spd is not None else (ad.get("published_at") or ad.get("published_date") or datetime.now(timezone.utc))
+                                        articles.append(Article(
+                                            id=u2,
+                                            title=ad.get("title", ""),
+                                            content=ad.get("content", ""),
+                                            url=u2,
+                                            source=ad.get("source", "unknown"),
+                                            published_at=pref_pub,
+                                            category=ad.get("category", alert.category),
+                                            metadata=meta
+                                        ))
+                                    except Exception as e:
+                                        logger.error(f"Error creating article from trusted RSS: {e}")
+                            except Exception as e:
+                                logger.warning(f"Trusted RSS search failed: {e}")
                     except Exception as e:
                         logger.warning(f"Trusted query search failed: {e}")
 
-            sources = ["google_news", "official_rss", "serp_search"]
-            # Add Cricbuzz live feed if this looks like a cricket alert
+            sources = ["official_rss", "google_news", "serp_search"]
+            # Detect live/score intent from user question/followups
+            cq_text = (alert.custom_question or "") + " " + " ".join(alert.followup_questions or [])
+            live_needles = ["live", "score", "scores", "over", "overs", "powerplay", "chasing", "target", "scorecard", "wickets"]
+            has_live_intent = any(n in cq_text.lower() for n in live_needles)
+            # Add Cricbuzz live feed if cricket or live intent
             is_cricket = (alert.category or "").lower() == "cricket" or ("cricket" in [s.lower() for s in (alert.sub_categories or [])])
-            if is_cricket:
-                sources.insert(0, "cricbuzz_live")
+            if is_cricket or has_live_intent:
+                # Prefer fast live sources; skip RSS for speed when live intent
+                sources = ["cricbuzz_live", "google_news", "serp_search"]
             tasks = [
                 self.news_fetcher.fetch(source, selected_query, category=alert.category)
                 for source in sources
@@ -387,15 +488,49 @@ class RAGPipeline:
                         continue
                     seen_urls.add(u)
                     try:
+                        meta2 = article_data.get("metadata", {}) or {}
+                        spd2 = article_data.get("scraped_published_date")
+                        if spd2 is not None:
+                            meta2["scraped_published_date"] = spd2
+                        # Propagate image from source result - check all possible fields
+                        img2 = (
+                            article_data.get("image") 
+                            or article_data.get("image_url")
+                            or (meta2.get("image") if isinstance(meta2, dict) else None)
+                            or ""
+                        )
+                        # If still no image, try scraping from article page
+                        if not img2 and u:
+                            try:
+                                img2 = await self.news_fetcher._scrape_article_image(u)
+                            except Exception:
+                                img2 = None
+                        
+                        # If still no image, try Google Images search based on article title
+                        if not img2:
+                            try:
+                                article_title = article_data.get("title", "")
+                                if article_title:
+                                    img2 = await self.news_fetcher._search_google_image(article_title)
+                                    if img2:
+                                        logger.debug(f"Found image via Google Images search for '{article_title[:40]}'")
+                            except Exception as img_err:
+                                logger.debug(f"Google Images search failed: {type(img_err).__name__}")
+                                img2 = None
+                        if img2:
+                            meta2["image"] = img2
+                            meta2["image_url"] = img2
+                        # Prefer scraped date if present
+                        pref_pub2 = spd2 if spd2 is not None else (article_data.get("published_at") or article_data.get("published_date"))
                         articles.append(Article(
                             id=u,
                             title=article_data.get("title", ""),
                             content=article_data.get("content", ""),
                             url=u,
                             source=article_data.get("source", "unknown"),
-                            published_at=_to_aware_utc(article_data.get("published_at") or article_data.get("published_date")),
+                            published_at=_to_aware_utc(pref_pub2),
                             category=article_data.get("category", alert.category),
-                            metadata=article_data.get("metadata", {})
+                            metadata=meta2
                         ))
                     except Exception as e:
                         logger.error(f"Error creating article: {e}")
@@ -411,7 +546,7 @@ class RAGPipeline:
             if not recent_articles:
                 try:
                     base_q = (" ".join(alert.canonical_entities) if alert.canonical_entities else selected_query) or (alert.category or "")
-                    fallback_items = await search_google_news(base_q, num_results=10, days_back=7, language="en", region="in")
+                    fallback_items = await search_google_news(base_q, num_results=10, days_back=1, language="en", region="in")
                     for item in fallback_items:
                         u = item.get("url")
                         if not u:
@@ -578,13 +713,34 @@ class RAGPipeline:
                 return any(f in hay for f in forb)
 
             pre_filtered = [a for a in articles if _matches_pref(a) and not _contains_forbidden(a)]
-            if not pre_filtered and needles:
-                logger.info("Stage3 Filter -> strict mode: no articles matched user entities; returning empty")
-                return {
-                    "filtered_ranked_articles": [],
-                    "included_count": 0,
-                    "excluded_count": len(articles)
-                }
+            # If strict filtering removed everything but we have needles, fallback to category match
+            if not pre_filtered and needles and articles:
+                logger.info("Stage3 Filter -> strict mode: no exact entity matches; falling back to category-based filtering")
+                # Less strict: match if article category matches or title contains category keywords
+                cat_lower = (alert.category or "").lower()
+                fallback_filtered = [
+                    a for a in articles 
+                    if not _contains_forbidden(a) and (
+                        (a.category or "").lower() == cat_lower 
+                        or any(needle in (a.title or "").lower() for needle in needles[:2])  # Try top 2 entities
+                        or not needles  # If somehow needles empty, include
+                    )
+                ]
+                if fallback_filtered:
+                    pre_filtered = fallback_filtered[:10]  # Limit fallback results
+                    logger.info(f"Stage3 Filter -> Fallback found {len(pre_filtered)} articles")
+                else:
+                    # Last resort: return top articles by recency if category matches
+                    recent_by_cat = [
+                        a for a in articles 
+                        if not _contains_forbidden(a) and (a.category or "").lower() == cat_lower
+                    ][:5]
+                    if recent_by_cat:
+                        pre_filtered = recent_by_cat
+                        logger.info(f"Stage3 Filter -> Last resort: {len(pre_filtered)} category-matched articles")
+            elif not pre_filtered and not needles:
+                # No needles means user wants general category news - keep all non-forbidden
+                pre_filtered = [a for a in articles if not _contains_forbidden(a)]
             articles = pre_filtered
         except Exception:
             pass
@@ -638,6 +794,110 @@ class RAGPipeline:
                     articles = live_only
         except Exception:
             pass
+
+        # NEW GATEKEEPER: Verify 24-hour constraint + LLM relevance + Generate title/description
+        logger.info(f"Stage3 Gatekeeper -> Processing {len(articles)} articles through gatekeeper")
+        
+        if not hasattr(self, 'gatekeeper'):
+            logger.warning("Stage3 Gatekeeper -> No gatekeeper instance found, skipping")
+            # Continue to fallback
+        elif not self.gatekeeper:
+            logger.warning("Stage3 Gatekeeper -> Gatekeeper is None, skipping")
+            # Continue to fallback
+        else:
+            try:
+                # Convert Article objects to dictionaries for gatekeeper
+                articles_dicts = []
+                for idx, article in enumerate(articles):
+                    article_dict = {
+                        "_index": idx,  # Track original position
+                        "title": article.title,
+                        "content": article.content,
+                        "url": article.url,
+                        "source": article.source,
+                        "published_at": article.published_at,
+                        "category": article.category,
+                        "metadata": article.metadata
+                    }
+                    articles_dicts.append(article_dict)
+
+                # Build user preferences dict from alert
+                user_prefs = {
+                    "category": alert.category,
+                    "sub_categories": alert.sub_categories,
+                    "canonical_entities": alert.canonical_entities,
+                    "custom_question": alert.custom_question,
+                    "forbidden_topics": alert.forbidden_topics
+                }
+
+                # Run gatekeeper with NEW ONE NEWS PER TOPIC logic
+                gatekeeper_result = await self.gatekeeper.filter_articles(
+                    articles_dicts, 
+                    user_prefs,
+                    db=self.db,
+                    alert_id=alert.alert_id,
+                    user_id=alert.user_id
+                )
+
+                # Extract approved articles (1 per topic - to send NOW)
+                approved_articles = gatekeeper_result.get("approved_articles", [])
+                pending_articles = gatekeeper_result.get("pending_articles", [])
+                stats = gatekeeper_result.get("stats", {})
+
+                if not approved_articles:
+                    logger.info("Stage3 Gatekeeper -> No articles passed gatekeeper validation")
+                    return {
+                        "filtered_ranked_articles": [],
+                        "included_count": 0,
+                        "excluded_count": len(articles),
+                        "pending_count": len(pending_articles)
+                    }
+
+                # Convert back to Article objects with enriched data
+                enriched_articles = []
+                for approved in approved_articles:
+                    # Find original Article object by index
+                    article_idx = approved.get("_index")
+                    if article_idx is not None and article_idx < len(articles):
+                        original = articles[article_idx]
+                        # Add generated title and description to metadata (ALWAYS use LLM-generated)
+                        if not original.metadata:
+                            original.metadata = {}
+                        # IMPORTANT: Use LLM-generated title/description from gatekeeper (NOT original)
+                        llm_title = approved.get("generated_title", "").strip()
+                        llm_desc = approved.get("generated_description", "").strip()
+                        # Only fallback to original if LLM failed to generate
+                        if not llm_title:
+                            llm_title = original.title
+                        if not llm_desc:
+                            llm_desc = original.content[:200] if original.content else original.title
+                        original.metadata["generated_title"] = llm_title
+                        original.metadata["generated_description"] = llm_desc
+                        original.metadata["relevance_score"] = float(approved.get("relevance_score", 0.5) or 0.5)
+                        original.metadata["topic"] = approved.get("topic", "general") or "general"
+                        # Also update the Article's title/content with LLM-generated version
+                        original.title = llm_title
+                        enriched_articles.append(original)
+
+                logger.info(
+                    f"Stage3 Gatekeeper -> {len(enriched_articles)} articles approved to send NOW "
+                    f"(1 per topic), {len(pending_articles)} queued for next cron"
+                )
+
+                # Return gatekeeper-approved articles directly (skip redundant LLM filtering)
+                return {
+                    "filtered_ranked_articles": enriched_articles,
+                    "included_count": len(enriched_articles),
+                    "excluded_count": stats.get("total_rejected", 0),
+                    "pending_count": len(pending_articles),
+                    "topics_found": stats.get("topics_found", 0),
+                    "gatekeeper_stats": stats
+                }
+
+            except Exception as e:
+                logger.error(f"Stage3 Gatekeeper -> Error in gatekeeper: {e}", exc_info=True)
+                logger.error("Falling back to original filtering (no title/description generation)")
+                # If gatekeeper fails, continue with original logic
 
         prompt = self._build_filtering_prompt(alert, articles)
         logger.info(
@@ -789,6 +1049,58 @@ class RAGPipeline:
         await self.notification_queue.insert_one(notification_doc)
         logger.info(f"Queued {len(top_articles)} articles for alert {alert.alert_id}")
         return notification_doc
+    
+    async def _get_and_clear_pending_articles(self, alert_id: str, user_id: str) -> List[Dict[str, Any]]:
+        """
+        Get pending articles from previous cron and mark them for sending
+        
+        Args:
+            alert_id: Alert ID to get pending articles for
+            user_id: User ID
+            
+        Returns:
+            List of pending article dictionaries
+        """
+        if not alert_id or not user_id:
+            return []
+        
+        try:
+            pending_collection = self.db.get_collection("pending_articles")
+            
+            # Find pending articles for this alert
+            query = {
+                "alert_id": alert_id,
+                "user_id": user_id,
+                "status": "pending"
+            }
+            
+            pending_docs = await pending_collection.find(query).to_list(None)
+            
+            if not pending_docs:
+                return []
+            
+            logger.info(f"Found {len(pending_docs)} pending articles for alert {alert_id}")
+            
+            # Remove MongoDB _id and return clean article list
+            articles = []
+            for doc in pending_docs:
+                # Remove MongoDB-specific fields
+                doc.pop("_id", None)
+                doc.pop("alert_id", None)
+                doc.pop("user_id", None)
+                doc.pop("status", None)
+                doc.pop("queued_at", None)
+                articles.append(doc)
+            
+            # Delete pending articles after retrieving
+            result = await pending_collection.delete_many(query)
+            logger.info(f"Cleared {result.deleted_count} pending articles from queue")
+            
+            return articles
+            
+        except Exception as e:
+            logger.error(f"Error getting pending articles: {e}")
+            return []
     
     async def get_pending_notifications(self, user_id: str = None, alert_id: str = None) -> List[Dict[str, Any]]:
         """
@@ -1081,73 +1393,4 @@ async def example_usage():
         # Clean up
         await llm_client.close()
         mongo_client.close()
-async def _parse_alert_preferences(self, alert_data: Dict[str, Any]) -> AlertPreference:
-    """Parse raw alert data into structured AlertPreference object"""
-    logger.info(f"Parsing alert preferences: {alert_data}")
 
-    # Create basic AlertPreference with required fields
-    alert_pref = AlertPreference(
-        alert_id=alert_data.get("alert_id", str(uuid.uuid4())),
-        user_id=alert_data.get("user_id", ""),
-        category=alert_data.get("category", alert_data.get("main_category", "")),
-        sub_categories=alert_data.get("sub_categories", []),
-        followup_questions=alert_data.get("followup_questions", []),
-        custom_question=alert_data.get("custom_question", "")
-    )
-
-    # Generate prompt for LLM to extract additional information
-    prompt = self._build_preference_parsing_prompt(alert_data)
-    logger.debug(f"Generated prompt for LLM: {prompt}")
-
-    try:
-        # Get response from LLM
-        response = await self.llm.generate(prompt)
-        logger.debug(f"LLM response: {response}")
-
-        # Parse the LLM response
-        parsed_data = self._parse_llm_response(response)
-        logger.info(f"Parsed LLM data: {parsed_data}")
-
-        # Update alert_pref with parsed data
-        if isinstance(parsed_data, dict):
-            alert_pref.canonical_entities = parsed_data.get("canonical_entities", [])
-            alert_pref.event_conditions = parsed_data.get("event_conditions", [])
-            alert_pref.contextual_query = parsed_data.get("contextual_query", "")
-            alert_pref.forbidden_topics = parsed_data.get("forbidden_topics", [])
-            
-            # If contextual_query is empty, generate one from the alert data
-            if not alert_pref.contextual_query:
-                alert_pref.contextual_query = self._generate_default_contextual_query(alert_data)
-
-    except Exception as e:
-        logger.error(f"Error parsing alert preferences: {str(e)}")
-        # Set default values in case of error
-        alert_pref.canonical_entities = []
-        alert_pref.event_conditions = []
-        alert_pref.contextual_query = self._generate_default_contextual_query(alert_data)
-        alert_pref.forbidden_topics = []
-
-    # Log the final alert preference
-    logger.info(f"Created AlertPreference: {alert_pref}")
-    return alert_pref
-
-def _generate_default_contextual_query(self, alert_data: Dict[str, Any]) -> str:
-    """Generate a default contextual query from alert data"""
-    query_parts = []
-    
-    if alert_data.get("category"):
-        query_parts.append(alert_data["category"])
-    
-    if alert_data.get("sub_categories"):
-        query_parts.extend(alert_data["sub_categories"])
-    
-    if alert_data.get("followup_questions"):
-        query_parts.extend(alert_data["followup_questions"])
-    
-    if alert_data.get("custom_question"):
-        query_parts.append(alert_data["custom_question"])
-    
-    return " ".join(query_parts) or "latest news"
-
-if __name__ == "__main__":
-    asyncio.run(example_usage())

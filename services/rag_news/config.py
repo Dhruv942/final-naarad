@@ -16,6 +16,65 @@ WATI_BASE_URL = 'https://live-mt-server.wati.io/458913'
 WATI_TEMPLATE_NAME = 'sports'
 WATI_BROADCAST_NAME = 'sports_290920250931'
 
+# Gatekeeper Configuration
+GATEKEEPER_PROMPT = """
+**Gatekeeper Decision Protocol v2.1**  
+*Sports/Finance Multi-Topic Edition*
+
+**Objectives**:
+1. STRICT 1:1 topic:news ratio (EXCEPT breaking news)
+2. Sports priority: Cricket > Football > Other sports
+3. Finance priority: Stocks > Forex > Crypto
+4. Breaking news threshold: score > 8.5 (sports: >7.5)
+
+**Processing Rules**:
+1. First Pass:
+   - For each topic, select top-scoring item
+   - If breaking news found, check secondary items
+   - Sports news: Verify team/player mentions
+   
+2. Title Rewriting:
+   Sports: "[🏏 Cricket] {title}"  
+   Finance: "[📈 Stocks] {title}"  
+   Breaking: "🚨 {title}"
+
+**Output Format**:
+```json
+{{
+  "selected_news": [
+    {{
+      "topic": "...",
+      "title": "...", 
+      "summary": "...",
+      "url": "...",
+      "is_breaking": bool,
+      "why_sent": "..."
+    }}
+  ],
+  "pending_queue": {{
+    "topic1": [
+      {{
+        "url": "...", 
+        "reason": "..."
+      }}
+    ]
+  }},
+  "stats": {{
+    "breaking_alerts": int,
+    "sports_news": int
+  }}
+}}
+```
+"""
+
+# Sports entity categories
+SPORTS_ENTITY_PRIORITY = {
+    "cricket": ["IPL", "India", "Virat Kohli", "Rohit Sharma"],
+    "football": ["FIFA", "UEFA", "Premier League"],
+    "tennis": ["Wimbledon", "US Open"],
+    "olympics": ["Olympics"]
+}
+
 # RSS Feeds Configuration
 CATEGORY_RSS_FEEDS = {
     "sports": [
