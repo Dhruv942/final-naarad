@@ -422,6 +422,8 @@ Example: "dollar price and Yes Bank stock" →
                             except Exception as e:
                                 logger.error(f"Error creating article from trusted query: {e}")
                         # Also try Google News RSS via NewsFetcher for the same trusted query (skip if live intent for speed)
+                        # Ensure variable is defined even if intent detection happens later
+                        has_live_intent = locals().get("has_live_intent", False)
                         if not has_live_intent:
                             try:
                                 rss_items = await self.news_fetcher.fetch("google_news", tq, category=alert.category)

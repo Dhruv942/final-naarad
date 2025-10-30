@@ -266,7 +266,7 @@ class RAGSystem:
     def __init__(self, mongo_db, gemini_api_key: str):
         self.db = mongo_db
         self.gemini_api_key = gemini_api_key
-        self.gemini_endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        self.gemini_endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 
         # Initialize embedding model - Using L6-v2 for better semantic understanding
         self.embedding_model = SentenceTransformer("paraphrase-MiniLM-L6-v2")

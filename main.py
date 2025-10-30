@@ -10,25 +10,33 @@ import os
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Reduce noisy third-party request logs (HTTP Request: GET ...)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("primp").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # RAG system startup - no more old ML models
-    logger.info("\ud83d\ude80 Starting Naarad with RAG Intelligence System")
+    logger.info("🚀 Starting Naarad with RAG Intelligence System")
 
-    # Start the news alert scheduler in background (disabled for testing)
-    scheduler_task = None
+    # Start the news alert scheduler in background
+    from schedulers.news_pipeline_scheduler import start_news_pipeline_scheduler
+    scheduler_task = asyncio.create_task(start_news_pipeline_scheduler(interval_minutes=60))
+    logger.info("📅 News Alert Scheduler started in background (60m interval)")
 
     yield
 
     # Shutdown
-    logger.info("\ud83d\udeb1 Shutting down Naarad RAG system")
-    if scheduler_task:
-        scheduler_task.cancel()
-        try:
-            await scheduler_task
-        except asyncio.CancelledError:
-            pass
-        logger.info("\ud83d\udcc5 News Alert Scheduler stopped")
+    logger.info("🛑 Shutting down Naarad RAG system")
+    scheduler_task.cancel()
+    try:
+        await scheduler_task
+    except asyncio.CancelledError:
+        pass
+    logger.info("📅 News Alert Scheduler stopped")
 
 # FastAPI App
 app = FastAPI(
@@ -81,6 +89,6 @@ async def health_check():
 # Root
 @app.get("/")
 async def root():
-    return {"message": "Welcome to News App API naaaaaaarad"}
+    return {"message": "Welcome to News App API narrad"}
 
 

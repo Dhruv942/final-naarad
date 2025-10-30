@@ -18,8 +18,9 @@ logger = logging.getLogger(__name__)
 class AlertScheduler:
     """Handles scheduled alert notifications"""
 
-    def __init__(self):
+    def __init__(self, check_interval_minutes: int = 1):
         self.running = False
+        self.check_interval_minutes = check_interval_minutes
         # Initialize RAG Pipeline
         self.llm_client = LLMClient()
         self.news_fetcher = NewsFetcher()
@@ -29,15 +30,21 @@ class AlertScheduler:
     async def start_scheduler(self):
         """Start the scheduler loop"""
         self.running = True
-        logger.info("Alert Scheduler started")
+        logger.info(f"[CRON] Alert scheduler started (check every {self.check_interval_minutes}m)")
 
         while self.running:
             try:
+                logger.info("[CRON] Alert cycle start")
                 await self.process_scheduled_alerts()
-                await asyncio.sleep(60)  # Check every minute
+                logger.info("[CRON] Alert cycle over")
+                await asyncio.sleep(self.check_interval_minutes * 60)  # Configurable interval
+            except asyncio.CancelledError:
+                logger.info("[CRON] Alert scheduler cancelled")
+                self.running = False
+                break
             except Exception as e:
                 logger.error(f"Error in scheduler loop: {e}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(self.check_interval_minutes * 60)
 
     def stop_scheduler(self):
         """Stop the scheduler"""
@@ -178,7 +185,8 @@ class AlertScheduler:
             alert_id = str(alert.get("_id", alert.get("alert_id")))
             user_id = alert.get("user_id")
 
-            logger.info(f"Processing scheduled alert {alert_id} for user {user_id}")
+            # minimal log per user
+            logger.info(f"[WATI] user={user_id} alert={alert_id}")
 
             # Prepare alert data for RAG pipeline
             alert_data = {
@@ -213,7 +221,7 @@ class AlertScheduler:
             notification = pending_notifications[0]
             articles = notification.get("articles", [])
 
-            logger.info(f"Sending {len(articles)} articles for alert {alert_id}")
+            # no verbose counts
 
             # Send each article as separate WhatsApp notification
             for article in articles:
@@ -226,9 +234,13 @@ class AlertScheduler:
                     "articles": [article]
                 }
 
-                # TODO: Send WhatsApp notification via WATI
-                # wati_response = await send_wati_notification(user_id, alert_result)
-                wati_response = {"status": "success", "message": "Notification sent"}
+                # Send WhatsApp notification via WATI
+                try:
+                    from controllers.send_controller import send_wati_notification
+                    wati_response = await send_wati_notification(user_id, alert_result)
+                except Exception as e:
+                    wati_response = {"status": "error", "message": str(e)}
+                logger.info(f"[WATI] response: {wati_response}")
                 logger.info(f"Notification sent: {wati_response.get('status', 'unknown')}")
 
                 # Add small delay between notifications
@@ -242,7 +254,7 @@ class AlertScheduler:
 
             # Update last sent timestamp
             await update_alert_last_sent(alert_id)
-            logger.info(f"Completed scheduled alert {alert_id}")
+            # done
 
         except Exception as e:
             logger.error(f"Error sending scheduled alert: {e}", exc_info=True)
@@ -272,9 +284,12 @@ class AlertScheduler:
                     "articles": [article]
                 }
 
-                # TODO: Send WhatsApp notification via WATI
-                # wati_response = await send_wati_notification(user_id, alert_result)
-                wati_response = {"status": "success", "message": "Notification sent"}
+                try:
+                    from controllers.send_controller import send_wati_notification
+                    wati_response = await send_wati_notification(user_id, alert_result)
+                except Exception as e:
+                    logger.error(f"Failed WATI send (one-time): {e}")
+                    wati_response = {"status": "error", "message": str(e)}
                 logger.info(f"One-time notification sent: {wati_response.get('status', 'unknown')}")
 
                 # Add small delay between notifications
@@ -289,14 +304,18 @@ class AlertScheduler:
 
 
 # Global scheduler instance
-alert_scheduler = AlertScheduler()
+alert_scheduler = None
 
 
-async def start_alert_scheduler():
+async def start_alert_scheduler(check_interval_minutes: int = 60):
     """Start the alert scheduler"""
+    global alert_scheduler
+    alert_scheduler = AlertScheduler(check_interval_minutes=check_interval_minutes)
     await alert_scheduler.start_scheduler()
 
 
 def stop_alert_scheduler():
     """Stop the alert scheduler"""
-    alert_scheduler.stop_scheduler()
+    global alert_scheduler
+    if alert_scheduler:
+        alert_scheduler.stop_scheduler()

@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class LLMArticleRanker:
     """Filters and ranks articles using LLM reasoning."""
     
-    def __init__(self, api_key: str, model: str = "gemini-2.0-flash-exp"):
+    def __init__(self, api_key: str, model: str = "gemini-2.5-flash"):
         """Initialize with Gemini API."""
         self.api_key = api_key
         self.model_name = model

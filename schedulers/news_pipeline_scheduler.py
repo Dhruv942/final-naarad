@@ -25,7 +25,7 @@ class NewsPipelineScheduler:
         self,
         gemini_api_key: str,
         interval_minutes: int = 60,
-        model: str = "gemini-2.0-flash-exp"
+        model: str = "gemini-2.5-flash"
     ):
         """
         Initialize the scheduler.
@@ -54,20 +54,46 @@ class NewsPipelineScheduler:
     async def start(self):
         """Start the scheduler loop."""
         self.running = True
-        logger.info("🚀 News Pipeline Scheduler started")
+        logger.info("[CRON] News pipeline scheduler started")
         
         while self.running:
             try:
                 await self._run_pipeline_cycle()
                 
                 # Wait for next cycle
-                logger.info(f"⏰ Next run in {self.interval_minutes} minutes")
+                logger.info(f"[CRON] Next run in {self.interval_minutes} minutes")
                 await asyncio.sleep(self.interval_minutes * 60)
                 
+            except asyncio.CancelledError:
+                logger.info("[CRON] News pipeline scheduler cancelled")
+                self.running = False
+                break
             except Exception as e:
                 logger.error(f"Error in scheduler loop: {str(e)}")
                 # Wait 5 minutes before retrying on error
                 await asyncio.sleep(300)
+
+    async def start_burst(self, burst_minutes: int = 8):
+        """Run the scheduler for a fixed burst window, then stop.
+
+        Keeps the task alive for `burst_minutes` while running at least one cycle.
+        """
+        self.running = True
+        window_end = datetime.utcnow() + timedelta(minutes=burst_minutes)
+        logger.info(f"[CRON] Burst start window {burst_minutes}m")
+        try:
+            # Always run at least one cycle
+            await self._run_pipeline_cycle()
+            # Stay alive (lightweight wait) until window end
+            while datetime.utcnow() < window_end and self.running:
+                await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            logger.info("[CRON] Burst cancelled")
+        except Exception as e:
+            logger.error(f"[CRON] Burst error: {e}")
+        finally:
+            self.running = False
+            logger.info("[CRON] Burst over")
     
     def stop(self):
         """Stop the scheduler."""
@@ -78,9 +104,7 @@ class NewsPipelineScheduler:
         """Run one cycle of the pipeline."""
         try:
             cycle_start = datetime.utcnow()
-            logger.info(f"\n{'='*60}")
-            logger.info(f"🔄 Starting news pipeline cycle at {cycle_start}")
-            logger.info(f"{'='*60}")
+            logger.info(f"[CRON] Cycle start {cycle_start.isoformat()}")
             
             # Run pipeline for all active alerts
             result = await self.pipeline.process_all_active_alerts()
@@ -88,15 +112,7 @@ class NewsPipelineScheduler:
             cycle_end = datetime.utcnow()
             duration = (cycle_end - cycle_start).total_seconds()
             
-            if result:
-                logger.info(f"\n{'='*60}")
-                logger.info(f"✅ Pipeline cycle complete!")
-                logger.info(f"   Duration: {duration:.2f} seconds")
-                logger.info(f"   Alerts processed: {result['successful']}/{result['total_alerts']}")
-                logger.info(f"   Articles queued: {result['total_articles']}")
-                logger.info(f"{'='*60}\n")
-            else:
-                logger.warning(f"⚠️ Pipeline cycle completed with no results")
+            logger.info(f"[CRON] Cycle over (duration {duration:.2f}s)")
             
             self.last_run = cycle_end
             
@@ -145,6 +161,34 @@ async def start_news_pipeline_scheduler(
     await _scheduler.start()
 
 
+async def start_news_pipeline_bursts(
+    gemini_api_key: str = None,
+    interval_minutes: int = 60,
+    burst_minutes: int = 8,
+):
+    """Continuously run bursts: run for burst_minutes, then wait until the next interval.
+
+    Example: burst 8 minutes, then sleep 52 minutes => repeats hourly.
+    """
+    global _scheduler
+    if not gemini_api_key:
+        gemini_api_key = os.getenv("GEMINI_API_KEY", "AIzaSyAydFe00gWhKQYdoF7oKD6QALZMwnCfkus")
+
+    while True:
+        try:
+            _scheduler = NewsPipelineScheduler(
+                gemini_api_key=gemini_api_key,
+                interval_minutes=interval_minutes,
+            )
+            await _scheduler.start_burst(burst_minutes=burst_minutes)
+        except Exception as e:
+            logger.error(f"[CRON] Burst runner error: {e}")
+        # Sleep the remainder of the interval
+        sleep_secs = max(0, (interval_minutes - burst_minutes) * 60)
+        logger.info(f"[CRON] Next burst in {sleep_secs // 60} minutes")
+        await asyncio.sleep(sleep_secs)
+
+
 def stop_news_pipeline_scheduler():
     """Stop the news pipeline scheduler."""
     global _scheduler
@@ -164,6 +208,38 @@ async def run_pipeline_manually():
         )
     
     await _scheduler.run_once()
+
+
+async def start_news_pipeline_alternating(
+    gemini_api_key: str = None,
+    run_minutes: int = 1,
+    sleep_minutes: int = 1
+):
+    """Run scheduler alternating: ON for run_minutes, OFF for sleep_minutes.
+    
+    Example: run 1 minute, sleep 1 minute, repeat.
+    """
+    global _scheduler
+    if not gemini_api_key:
+        gemini_api_key = os.getenv("GEMINI_API_KEY", "AIzaSyAydFe00gWhKQYdoF7oKD6QALZMwnCfkus")
+
+    while True:
+        try:
+            logger.info(f"[CRON] Starting pipeline run for {run_minutes} minutes...")
+            _scheduler = NewsPipelineScheduler(
+                gemini_api_key=gemini_api_key,
+                interval_minutes=run_minutes
+            )
+            await _scheduler.start_burst(burst_minutes=run_minutes)
+        except asyncio.CancelledError:
+            logger.info("[CRON] Alternating scheduler cancelled")
+            break
+        except Exception as e:
+            logger.error(f"[CRON] Alternating scheduler error: {e}")
+        
+        # Sleep for sleep_minutes
+        logger.info(f"[CRON] Sleeping for {sleep_minutes} minutes...")
+        await asyncio.sleep(sleep_minutes * 60)
 
 
 # Example usage for testing

@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qsl, urlencode, urljoin
 import hashlib
 import os
+import httpx
 
 from core.rag_system_enhanced import RAGSystem, Document, UserProfile, SentenceTransformerEmbedding
 from core.rag_pipeline import RAGPipeline, AlertPreference, Article, NewsFetcher, LLMClient
@@ -102,6 +103,257 @@ def _validate_image_url(img_url: Optional[str], article_url: Optional[str] = Non
         return ""
     
     return img_url
+
+
+async def _enrich_images(items: List[Dict[str, Any]]) -> None:
+    """Populate image field for items that are missing one, using Google CSE, Google Images, OG scraping, and fallbacks."""
+    for item in items:
+        try:
+            if (item.get("image") or "").strip():
+                continue
+            title = item.get("title") or ""
+            url = item.get("url") or ""
+            source = item.get("source") or ""
+            category = (item.get("category") or "").lower()
+            topic = (item.get("topic") or "").lower()
+            keywords = [str(k).lower() for k in (item.get("keywords") or []) if isinstance(k, (str, int, float))]
+
+            final_image = ""
+
+            # 0) Unsplash API (royalty-free) FIRST: context-aware image
+            if not final_image:
+                try:
+                    unsplash_key = os.getenv("UNSPLASH_ACCESS_KEY") or os.getenv("UNSPLASH_CLIENT_ID") or "hXFHeM77GyNVp_Vyvh8NqQeFKO6aSIFAd4DceMxeu1c"
+                    if unsplash_key:
+                        async def _search_unsplash_image(q: str) -> str:
+                            try:
+                                if not q or len(q.strip()) < 3:
+                                    return ""
+                                headers = {"Accept-Version": "v1", "Authorization": f"Client-ID {unsplash_key}"}
+                                params = {"query": q.strip()[:80], "per_page": 1, "orientation": "landscape"}
+                                async with httpx.AsyncClient(timeout=8.0) as client:
+                                    resp = await client.get("https://api.unsplash.com/search/photos", headers=headers, params=params)
+                                    resp.raise_for_status()
+                                    data = resp.json()
+                                    results = data.get("results", [])
+                                    if results:
+                                        urls = (results[0] or {}).get("urls", {})
+                                        for key in ["regular", "full", "raw"]:
+                                            link = urls.get(key)
+                                            if link and isinstance(link, str) and link.startswith(("http://", "https://")):
+                                                return link
+                            except Exception:
+                                return ""
+                            return ""
+
+                        unsplash_queries: List[str] = []
+                        if title:
+                            unsplash_queries.append(title)
+                        if topic and title:
+                            unsplash_queries.append(f"{topic} {title}")
+                        if category and title:
+                            unsplash_queries.append(f"{category} {title}")
+                        if keywords and title:
+                            unsplash_queries.append(f"{' '.join(keywords[:3])} {title}")
+                        hay2 = " ".join([title.lower(), topic, category, " ".join(keywords)])
+                        if any(k in hay2 for k in ["gold", "bullion", "precious metal"]):
+                            unsplash_queries.insert(0, "gold bars")
+                        if any(k in hay2 for k in ["stock", "market", "exchange", "finance"]):
+                            unsplash_queries.append("stock market board")
+                        if any(k in hay2 for k in ["cricket", "match", "wicket", "bat"]):
+                            unsplash_queries.append("cricket stadium")
+                        if any(k in hay2 for k in ["tech", "technology", "ai", "software", "device"]):
+                            unsplash_queries.append("circuit board blue")
+
+                        for uq in unsplash_queries:
+                            link = await _search_unsplash_image(uq)
+                            if link:
+                                v = _validate_image_url(link)
+                                if v:
+                                    final_image = v
+                                    break
+                except Exception as _us_err:
+                    logger.info(f"Unsplash image search failed: {_us_err}")
+
+            # 1) Google CSE via site/title queries (augmented with topic/keywords)
+            try:
+                from urllib.parse import urlparse as _urlparse
+                host = _urlparse(url).netloc if url else ''
+                queries: List[str] = []
+                if title:
+                    if host:
+                        queries.append(f"site:{host} \"{title}\"")
+                    if source:
+                        queries.append(f"{source} \"{title}\"")
+                    queries.append(f"\"{title}\"")
+                # Add topic/keywords variants
+                if topic and title:
+                    queries.append(f"{topic} \"{title}\"")
+                if category and title:
+                    queries.append(f"{category} \"{title}\"")
+                if keywords and title:
+                    queries.append(f"{' '.join(keywords[:3])} \"{title}\"")
+                # Cricket team-based queries if title has vs
+                try:
+                    ttl_lower = title.lower()
+                    if ' vs ' in ttl_lower or ' vs. ' in ttl_lower:
+                        base = title.split(' — ')[0]
+                        parts = base.replace(' vs. ', ' vs ').split(' vs ')
+                        if len(parts) == 2:
+                            team_a, team_b = parts[0].strip(), parts[1].strip()
+                            cric_host = host or 'www.cricbuzz.com'
+                            queries.extend([
+                                f"site:{cric_host} {team_a} {team_b} live",
+                                f"site:{cric_host} {team_a} vs {team_b} scorecard",
+                                f"cricket {team_a} vs {team_b} image",
+                            ])
+                except Exception:
+                    pass
+
+                for q in queries:
+                    cse_results = await search_google_news(q, num_results=5, days_back=30)
+                    for r in cse_results:
+                        img = r.get('image_url')
+                        validated = _validate_image_url(img, article_url=url)
+                        if validated:
+                            final_image = validated
+                            break
+                    if final_image:
+                        break
+            except Exception as _img_err:
+                logger.info(f"Image fetch via Google CSE failed: {_img_err}")
+
+            # 2) Google Images API and OG scraping via NewsFetcherService (include topic/keywords)
+            if not final_image:
+                try:
+                    from services.news_fetcher_service import NewsFetcherService as _NFS
+                    _nfs = _NFS()
+                    img_queries: List[str] = []
+                    if title:
+                        img_queries.append(title)
+                    if source and title:
+                        img_queries.append(f"{source} {title}")
+                    if topic and title:
+                        img_queries.append(f"{topic} {title}")
+                    if category and title:
+                        img_queries.append(f"{category} {title}")
+                    if keywords and title:
+                        img_queries.append(f"{' '.join(keywords[:3])} {title}")
+                    try:
+                        ttl_lower = title.lower()
+                        if ' vs ' in ttl_lower or ' vs. ' in ttl_lower:
+                            base = title.split(' — ')[0]
+                            parts = base.replace(' vs. ', ' vs ').split(' vs ')
+                            if len(parts) == 2:
+                                team_a, team_b = parts[0].strip(), parts[1].strip()
+                                img_queries.append(f"{team_a} {team_b} cricket")
+                                img_queries.append(f"{team_a} vs {team_b}")
+                    except Exception:
+                        pass
+                    for iq in img_queries:
+                        img = await _nfs._search_google_image(iq)
+                        if img:
+                            validated = _validate_image_url(img, article_url=url)
+                            if validated:
+                                final_image = validated
+                                break
+                    if not final_image and url:
+                        scraped = await _nfs._scrape_article_image(url)
+                        if scraped:
+                            validated = _validate_image_url(scraped, article_url=url)
+                            final_image = validated or ""
+                    await _nfs.close()
+                except Exception as _img2_err:
+                    logger.info(f"Image fetch via Google Images/OG failed: {_img2_err}")
+
+            # (Pexels removed as requested)
+
+            # 2.6) Unsplash API (royalty-free) as an additional image source
+            if not final_image:
+                try:
+                    unsplash_key = os.getenv("UNSPLASH_ACCESS_KEY") or os.getenv("UNSPLASH_CLIENT_ID") or "hXFHeM77GyNVp_Vyvh8NqQeFKO6aSIFAd4DceMxeu1c"
+                    if unsplash_key:
+                        async def _search_unsplash_image(q: str) -> str:
+                            try:
+                                if not q or len(q.strip()) < 3:
+                                    return ""
+                                headers = {"Accept-Version": "v1", "Authorization": f"Client-ID {unsplash_key}"}
+                                params = {"query": q.strip()[:80], "per_page": 1, "orientation": "landscape"}
+                                async with httpx.AsyncClient(timeout=8.0) as client:
+                                    resp = await client.get("https://api.unsplash.com/search/photos", headers=headers, params=params)
+                                    resp.raise_for_status()
+                                    data = resp.json()
+                                    results = data.get("results", [])
+                                    if results:
+                                        urls = (results[0] or {}).get("urls", {})
+                                        # Prefer regular > full > raw
+                                        for key in ["regular", "full", "raw"]:
+                                            link = urls.get(key)
+                                            if link and isinstance(link, str) and link.startswith(("http://", "https://")):
+                                                return link
+                            except Exception:
+                                return ""
+                            return ""
+
+                        unsplash_queries: List[str] = []
+                        if title:
+                            unsplash_queries.append(title)
+                        if topic and title:
+                            unsplash_queries.append(f"{topic} {title}")
+                        if category and title:
+                            unsplash_queries.append(f"{category} {title}")
+                        if keywords and title:
+                            unsplash_queries.append(f"{' '.join(keywords[:3])} {title}")
+                        hay2 = " ".join([title.lower(), topic, category, " ".join(keywords)])
+                        if any(k in hay2 for k in ["gold", "bullion", "precious metal"]):
+                            unsplash_queries.insert(0, "gold bars")
+                        if any(k in hay2 for k in ["stock", "market", "exchange", "finance"]):
+                            unsplash_queries.append("stock market board")
+                        if any(k in hay2 for k in ["cricket", "match", "wicket", "bat"]):
+                            unsplash_queries.append("cricket stadium")
+                        if any(k in hay2 for k in ["tech", "technology", "ai", "software", "device"]):
+                            unsplash_queries.append("circuit board blue")
+
+                        for uq in unsplash_queries:
+                            link = await _search_unsplash_image(uq)
+                            if link:
+                                v = _validate_image_url(link)
+                                if v:
+                                    final_image = v
+                                    break
+                except Exception as _us_err:
+                    logger.info(f"Unsplash image search failed: {_us_err}")
+
+            # 3) Fallbacks (category/topic/keyword aware)
+            if not final_image:
+                # Simple detectors
+                text_hay = " ".join([title.lower(), topic, category, " ".join(keywords)])
+                is_finance = any(k in text_hay for k in [
+                    'usd', 'inr', 'dollar', 'rupee', 'exchange', 'currency', 'rate', 'stock', 'market', 'gold', 'silver', 'oil'
+                ])
+                is_sport = any(k in text_hay for k in ['sport', 'cricket', 'match', 'vs']) or 'cricbuzz' in source.lower()
+                is_tech = any(k in text_hay for k in ['tech', 'technology', 'ai', 'software', 'app', 'device'])
+
+                if is_finance:
+                    # Finance/gold placeholder
+                    if 'gold' in text_hay:
+                        final_image = "https://upload.wikimedia.org/wikipedia/commons/6/69/Gold_Bars.jpg"
+                    else:
+                        final_image = "https://upload.wikimedia.org/wikipedia/commons/3/3a/Stock_Market_Board.jpg"
+                elif is_sport:
+                    if 'cricbuzz' in source.lower():
+                        final_image = "https://www.cricbuzz.com/a/img/v1/300x170/i1/c170657/cricbuzz-logo.png"
+                    else:
+                        final_image = "https://upload.wikimedia.org/wikipedia/commons/3/36/Cricket_stumps_bails.jpg"
+                elif is_tech:
+                    final_image = "https://upload.wikimedia.org/wikipedia/commons/5/5f/Circuit_Board_%28blue%29.jpg"
+                else:
+                    # Neutral news placeholder
+                    final_image = "https://upload.wikimedia.org/wikipedia/commons/6/65/Newspaper_Collage.jpg"
+
+            item["image"] = final_image
+        except Exception as e:
+            logger.info(f"Image enrichment failed for '{item.get('title','')[:40]}': {e}")
 
 async def _is_duplicate(user_id: str, url: str, title: str, dedup_hours: int = 1) -> bool:
     """Check if a news item has already been sent to the user."""
@@ -312,10 +564,8 @@ async def get_user_news(user_id: str) -> Dict[str, Any]:
                                 description = article_dict.content[:200] if article_dict.content else (article_dict.title + " - Latest news update")
                         relevance_score = float(metadata.get('relevance_score', 0) or 0)
                         topic = (metadata.get('topic') or 'general').strip()
-                        # Extract image from metadata if available
-                        if not metadata.get('image') and not metadata.get('image_url'):
-                            # Check if article_dict has image directly (for Cricbuzz)
-                            pass  # Will be handled in image extraction below
+                        # Extract image from metadata if available (handled later with validation)
+                        # We defer actual selection until before building result_item
                     
                     if not url or not title:
                         continue
@@ -425,11 +675,8 @@ async def get_user_news(user_id: str) -> Dict[str, Any]:
                         "relevance_score": float(relevance_score or 0)
                     }
 
-                    # TEMP: disable image fetching for now
-                    image_url = ""
-
-                    # Attach final image_url
-                    result_item["image"] = image_url
+                    # Defer image selection to a separate enrichment flow
+                    result_item["image"] = ""
                     processed_articles.append(result_item)
                 
                 if not processed_articles and articles_list:
@@ -472,14 +719,39 @@ async def get_user_news(user_id: str) -> Dict[str, Any]:
                 logger.error(f"Error processing alert {alert.get('_id')}: {str(e)}", exc_info=True)
                 continue
         
+        # Perform image enrichment as a separate flow
+        await _enrich_images(all_articles)
+
         # Sort articles by relevance score in descending order (handle None safely)
         all_articles.sort(key=lambda x: float(x.get("relevance_score") or 0), reverse=True)
         
+        # Immediately send top result via WATI (on GET) for quick user delivery
+        try:
+            wati_response_payload = None
+            if all_articles:
+                from controllers.send_controller import send_wati_notification
+                top = all_articles[0]
+                alert_id_for_send = top.get("alert_id") or (alerts[0].get("_id") if alerts else "")
+                alert_payload = {
+                    "alert_id": str(alert_id_for_send),
+                    "alert_category": top.get("category", ""),
+                    "alert_keywords": top.get("keywords", []),
+                    "total_articles": 1,
+                    "articles": [top]
+                }
+                wati_resp = await send_wati_notification(user_id, alert_payload)
+                wati_response_payload = wati_resp
+                if isinstance(wati_resp, dict) and wati_resp.get("status") == "success":
+                    logger.info(f"[WATI] message sent: code={wati_resp.get('code')} resp={str(wati_resp.get('response'))[:160]}")
+        except Exception as e:
+            logger.warning(f"[WATI] send failed: {e}")
+
         return {
             "status": "success",
             "user_id": user_id,
             "alerts_processed": len(alerts),
-            "results": all_articles
+            "results": all_articles,
+            "wati_response": wati_response_payload
         }
         
     except Exception as e:

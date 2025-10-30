@@ -28,7 +28,7 @@ class PersonalizedNewsPipeline:
         self,
         db: Database,
         gemini_api_key: str,
-        model: str = "gemini-2.0-flash-exp"
+        model: str = "gemini-2.5-flash"
     ):
         """
         Initialize the pipeline with all required services.
@@ -288,7 +288,7 @@ class PersonalizedNewsPipeline:
         try:
             logger.info("🔄 Starting batch processing of all active alerts")
             
-            # Get all active alerts
+            # Get all active alerts from alerts collection (not alertsparse)
             alerts = await self.alerts_collection.find({"is_active": True}).to_list(None)
             
             if not alerts:
@@ -297,19 +297,48 @@ class PersonalizedNewsPipeline:
             
             logger.info(f"Found {len(alerts)} active alerts to process")
             
-            # Process each alert
-            results = []
+            # Group alerts by user and process one user at a time (finish all alerts for a user before next)
+            alerts_by_user = {}
             for alert in alerts:
-                try:
-                    result = await self.process_alert_full_pipeline(alert, store_to_queue=True)
-                    results.append(result)
-                    
-                    # Small delay between alerts to avoid rate limiting
-                    await asyncio.sleep(1)
-                    
-                except Exception as e:
-                    logger.error(f"Error processing alert {alert.get('alert_id')}: {str(e)}")
-                    continue
+                uid = alert.get("user_id")
+                alerts_by_user.setdefault(uid, []).append(alert)
+
+            results = []
+            for uid, user_alerts in alerts_by_user.items():
+                logger.info(f"👤 Processing {len(user_alerts)} alerts for user {uid}")
+                for alert in user_alerts:
+                    try:
+                        # Ensure alert_id is present
+                        if "_id" in alert and "alert_id" not in alert:
+                            alert["alert_id"] = str(alert["_id"])
+                        result = await self.process_alert_full_pipeline(alert, store_to_queue=False)
+                        results.append(result)
+                        
+                        # Send WhatsApp notifications for successful results
+                        if result.get("status") == "success" and result.get("articles"):
+                            try:
+                                from controllers.send_controller import send_wati_notification
+                                for article in result.get("articles", []):
+                                    alert_payload = {
+                                        "alert_id": result["alert_id"],
+                                        "alert_category": alert.get("main_category", ""),
+                                        "alert_keywords": alert.get("sub_categories", []),
+                                        "total_articles": 1,
+                                        "articles": [article]
+                                    }
+                                    wati_response = await send_wati_notification(uid, alert_payload)
+                                    logger.info(f"WhatsApp sent to {uid}: {wati_response.get('status')}")
+                                    await asyncio.sleep(0.5)  # Small delay between messages
+                            except Exception as e:
+                                logger.error(f"Error sending WhatsApp to {uid}: {str(e)}")
+                        
+                        # Small delay between a user's alerts to avoid rate limiting
+                        await asyncio.sleep(1)
+                    except Exception as e:
+                        logger.error(f"Error processing alert {alert.get('alert_id')}: {str(e)}")
+                        continue
+                # Slightly larger pause between users
+                await asyncio.sleep(2)
             
             # Summary
             success_count = sum(1 for r in results if r.get("status") == "success")

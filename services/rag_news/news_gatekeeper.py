@@ -273,6 +273,60 @@ class NewsGatekeeper:
                     else:
                         generated_description = f"📈 {generated_title}"
 
+                # Final hardening: normalize, enforce entity mention, and remove UI fragments
+                try:
+                    blacklist = [
+                        'hours ago', 'days ago', 'minutes ago', 'what is the daily range',
+                        "today's", 'read more', 'article from', '...', 'view more', 'click here'
+                    ]
+                    entities = [e.lower() for e in user_preferences.get('canonical_entities', []) if isinstance(e, str)]
+
+                    def _mentions_entity(text: str) -> bool:
+                        if not entities:
+                            return True
+                        tl = (text or '').lower()
+                        return any(e in tl for e in entities)
+
+                    def _violates_blacklist(text: str) -> bool:
+                        tl = (text or '').lower()
+                        return any(b in tl for b in blacklist)
+
+                    def _normalize_sentence(text: str, max_chars: int) -> str:
+                        t = (text or '').strip()
+                        t = re.sub(r"\s+", " ", t)
+                        if len(t) > max_chars:
+                            t = t[:max_chars].rstrip()
+                        if t and t[-1] not in ".!?":
+                            t = t + "."
+                        return t
+
+                    # Clean blacklisted fragments
+                    if _violates_blacklist(generated_title):
+                        for b in blacklist:
+                            generated_title = re.sub(re.escape(b), '', generated_title, flags=re.IGNORECASE)
+                    if _violates_blacklist(generated_description):
+                        for b in blacklist:
+                            generated_description = re.sub(re.escape(b), '', generated_description, flags=re.IGNORECASE)
+
+                    # Normalize and bound lengths
+                    generated_title = _normalize_sentence(generated_title, 90)
+                    generated_description = _normalize_sentence(generated_description, 260)
+
+                    # Reject if still low quality
+                    if (not generated_title or len(generated_title.strip()) < 5 or
+                        not generated_description or len(generated_description.strip()) < 20 or
+                        _violates_blacklist(generated_title + ' ' + generated_description) or
+                        not _mentions_entity(generated_title + ' ' + generated_description)):
+                        return GatekeeperResult(
+                            is_approved=False,
+                            generated_title="",
+                            generated_description="",
+                            rejection_reason="LLM output failed quality constraints"
+                        )
+                except Exception:
+                    # If hardening fails, proceed with cleaned values
+                    pass
+
                 return GatekeeperResult(
                     is_approved=True,
                     generated_title=generated_title,
@@ -332,8 +386,8 @@ TASK:
 4. Generate CLEAN summary (STRICT FORMAT - NO UI FRAGMENTS):
 
 STRICT OUTPUT FORMAT:
-- Title: Clean headline with pair and rate (≤15 words). Example: "USD/INR: ₹88.20 today"
-- Description: {"📈 USD/INR: ₹[CURRENT_RATE] today. Previous close: ₹[PREV_CLOSE]. Daily range: ₹[LOW]–₹[HIGH]." if wants_price else "📈 Current price: [actual numbers]. Key change: [percentage/amount]."}
+- Title: Clean headline with pair and rate (≤15 words, ≤90 chars). Example: "USD/INR: ₹88.20 today"
+- Description: {"📈 USD/INR: ₹[CURRENT_RATE] today. Previous close: ₹[PREV_CLOSE]. Daily range: ₹[LOW]–₹[HIGH]." if wants_price else "📈 Current price: [actual numbers]. Key change: [percentage/amount]."} (40–260 chars, complete sentence, ends with a period)
 
 CRITICAL RATE VALIDATION:
 ⚠️ For USD/INR rates, ONLY use numbers between 70-100 (realistic range)
@@ -405,12 +459,20 @@ Return JSON:
 {{"is_relevant": true/false, "relevance_score": 0.0-1.0, "title": "...", "description": "..."}}"""
         else:
             # Regular news format
-            return f"""Check if article mentions ANY of these entities: {', '.join(user_preferences.get('canonical_entities', []))}
+            return f"""You are a news editor. Approve only if article clearly mentions ANY of these entities: {', '.join(user_preferences.get('canonical_entities', []))}
 
-Article: {article.get('title', '')} - {article.get('content', '')[:500]}
+Article: {article.get('title', '')}
+Content: {article.get('content', '')[:500]}
 
-Return:
-{{"is_relevant": true/false, "relevance_score": 0.0-1.0, "title": "short title", "description": "brief summary"}}"""
+STRICT OUTPUT:
+- title: ≤12 words, ≤80 chars, must include an entity, no UI fragments.
+- description: 40–220 chars, complete sentence, no UI fragments, ends with period.
+
+ABSOLUTE PROHIBITIONS:
+❌ No relative time ("hours ago"), ellipses ("..."), site UI ("Read more", "What Is the Daily Range", "Today's ...").
+
+Return JSON ONLY:
+{{"is_relevant": true/false, "relevance_score": 0.0-1.0, "title": "...", "description": "..."}}"""
 
     def _parse_gatekeeper_response(self, response: str) -> Dict[str, Any]:
         """Parse LLM response from gatekeeper validation"""
