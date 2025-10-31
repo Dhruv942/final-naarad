@@ -22,21 +22,25 @@ async def lifespan(app: FastAPI):
     # RAG system startup - no more old ML models
     logger.info("🚀 Starting Naarad with RAG Intelligence System")
 
-    # Start the news alert scheduler in background (30m ON, 30m OFF cycle)
-    from schedulers.news_pipeline_scheduler import start_news_pipeline_alternating
-    scheduler_task = asyncio.create_task(start_news_pipeline_alternating(run_minutes=30, sleep_minutes=30))
-    logger.info("📅 News Alert Scheduler started in background (30m ON, 30m OFF)")
+    # Start alternating news scheduler (30m ON, 30m OFF)
+    scheduler_task = None
+    try:
+        from schedulers.news_scheduler import start_alternating_scheduler
+        scheduler_task = asyncio.create_task(start_alternating_scheduler(run_minutes=30, sleep_minutes=30))
+        logger.info("📅 Alternating News Scheduler started (30m ON, 30m OFF)")
+    except Exception as e:
+        logger.error(f"Failed to start scheduler: {e}")
 
     yield
 
     # Shutdown
     logger.info("🛑 Shutting down Naarad RAG system")
-    scheduler_task.cancel()
-    try:
-        await scheduler_task
-    except asyncio.CancelledError:
-        pass
-    logger.info("📅 News Alert Scheduler stopped")
+    if scheduler_task:
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
 
 # FastAPI App
 app = FastAPI(

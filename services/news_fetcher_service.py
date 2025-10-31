@@ -449,13 +449,17 @@ class NewsFetcherService:
 
             concise_query = _build_concise_query()
 
-            # Choose sources: Cricbuzz only for live intents; otherwise Google News + RSS + SERP
+            # Choose sources: Google Custom Search API (primary) + RSS + SERP
             tasks: List[asyncio.Task] = []
+            # Primary: Google Custom Search API (better quality results)
+            tasks.append(self._fetch_google_custom_search(concise_query or contextual_query, category))
+            # Secondary: RSS feeds
             tasks.append(self._fetch_google_news(concise_query or contextual_query, category))
             tasks.append(self._fetch_official_rss(category))
+            # Fallback: SERP
             tasks.append(self._fetch_serp_fallback(concise_query or contextual_query))
+            # Live cricket: Cricbuzz
             if category == "cricket" and live_intent:
-                # Use entities as filters to keep relevant live matches
                 team_filters = [str(x).lower() for x in canonical_entities if isinstance(x, str)]
                 tasks.append(self._fetch_cricbuzz_live(team_filters))
 
@@ -476,18 +480,167 @@ class NewsFetcherService:
                         seen_urls.add(url)
                         all_articles.append(article)
             
+            # CRITICAL: Scrape actual published dates for ALL articles BEFORE filtering
+            # This ensures we use the real article date, not RSS feed date
+            logger.info(f"Scraping published dates for {len(all_articles)} articles...")
+            scraped_dates = [None] * len(all_articles)
+            
+            # Process in batches of 10 to avoid overwhelming servers
+            batch_size = 10
+            for i in range(0, len(all_articles), batch_size):
+                batch_articles = all_articles[i:i+batch_size]
+                batch_tasks = []
+                batch_positions = []
+                
+                for j, article in enumerate(batch_articles):
+                    url = article.get("url", "")
+                    # Only scrape if scraped_published_date not already set
+                    if url and not article.get("scraped_published_date"):
+                        batch_tasks.append(self._scrape_article_date(url))
+                        batch_positions.append(i + j)
+                
+                if batch_tasks:
+                    batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                    for pos, result in zip(batch_positions, batch_results):
+                        if not isinstance(result, Exception) and result:
+                            scraped_dates[pos] = result
+            
+            # Update articles with scraped dates (prioritize scraped over RSS date)
+            for article, scraped_dt in zip(all_articles, scraped_dates):
+                if scraped_dt:
+                    article["scraped_published_date"] = scraped_dt
+                    # Also update published_date - scraped date is always more accurate
+                    article["published_date"] = scraped_dt
+            
+            logger.info(f"Date scraping complete - ready for filtering")
+            
+            # Detect user's recency intent from query, custom question, and followups
+            def _detect_recency_intent(txts: List[str]) -> str:
+                """Detect how recent the user wants news based on keywords.
+                Returns: 'ultra_recent', 'recent', 'normal', 'historical'
+                """
+                hay = " ".join([str(t) for t in txts if isinstance(t, str)]).lower()
+                
+                # Ultra recent indicators (last few hours)
+                ultra_keywords = [
+                    "latest", "just now", "breaking", "breaking news",
+                    "newest", "fresh", "today's", "today", "this morning",
+                    "this afternoon", "last hour", "last few hours", "live update"
+                ]
+                if any(kw in hay for kw in ultra_keywords):
+                    return "ultra_recent"
+                
+                # Historical indicators (allow older news)
+                historical_keywords = [
+                    "last week", "last month", "this week", "this month",
+                    "past week", "past month", "history", "historical",
+                    "archive", "old news", "earlier", "before"
+                ]
+                if any(kw in hay for kw in historical_keywords):
+                    return "historical"
+                
+                # Recent indicators (default - last day or two)
+                recent_keywords = [
+                    "recent update", "recent news", "update", "news",
+                    "what happened", "latest update"
+                ]
+                if any(kw in hay for kw in recent_keywords):
+                    return "recent"
+                
+                # Default to normal
+                return "normal"
+            
+            # Combine all user text to understand intent
+            all_user_text = [
+                contextual_query,
+                custom_q,
+                " ".join(followups),
+                " ".join([str(e) for e in canonical_entities]),
+                " ".join([str(t) for t in tags])
+            ]
+            recency_intent = _detect_recency_intent(all_user_text)
+            
+            # Calculate dynamic cutoff time based on category + user intent
+            now = datetime.now(timezone.utc)
+            cutoff_time = None
+            cat_l = (category or "").lower()
+            
+            # Category-specific cutoff times (strict for time-sensitive categories)
+            if cat_l in ["sports", "cricket"]:
+                # FORCE 24 hours for sports/cricket - no exceptions (latest scores/updates needed)
+                cutoff_time = now - timedelta(hours=24)
+            elif cat_l in ["financial", "stocks", "forex", "crypto", "business", "stock"]:
+                # Financial categories need latest rates/prices - 24 hours strict
+                cutoff_time = now - timedelta(hours=24)
+            else:
+                # For News, Movies, YouTube, etc. - use dynamic intent-based filtering
+                if recency_intent == "ultra_recent":
+                    cutoff_time = now - timedelta(hours=12)
+                elif recency_intent == "recent":
+                    cutoff_time = now - timedelta(hours=24)
+                elif recency_intent == "historical":
+                    cutoff_time = now - timedelta(days=14)
+                else:
+                    cutoff_time = now - timedelta(days=3)
+            
+            logger.info(f"Recency intent detected: {recency_intent} for category '{category}' -> cutoff: {cutoff_time.isoformat()}")
+            
+            # Filter out old articles - STRICT: prioritize scraped_published_date (most accurate)
+            recent_articles = []
+            rejected_old = 0
+            rejected_no_date = 0
+            
+            for article in all_articles:
+                # PRIORITY: scraped_published_date > published_date > fetched_at
+                # scraped_published_date is the actual article date (most accurate)
+                pub_date = article.get("scraped_published_date") or article.get("published_date")
+                
+                # If still no date, use fetched_at as last resort (but this is less accurate)
+                if not pub_date:
+                    pub_date = article.get("fetched_at")
+                
+                # REJECT if no date at all (don't assume recent - be strict)
+                if not pub_date:
+                    rejected_no_date += 1
+                    logger.debug(f"Rejecting article (no date): {article.get('title', '')[:50]}")
+                    continue
+                
+                # Ensure timezone-aware
+                if isinstance(pub_date, datetime):
+                    if pub_date.tzinfo is None:
+                        pub_date = pub_date.replace(tzinfo=timezone.utc)
+                else:
+                    # Try to parse string date
+                    try:
+                        if isinstance(pub_date, str):
+                            pub_date = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
+                            if pub_date.tzinfo is None:
+                                pub_date = pub_date.replace(tzinfo=timezone.utc)
+                    except:
+                        rejected_no_date += 1
+                        logger.debug(f"Rejecting article (invalid date): {article.get('title', '')[:50]}")
+                        continue
+                
+                # STRICT CHECK: Only include if within cutoff time
+                if pub_date >= cutoff_time:
+                    recent_articles.append(article)
+                else:
+                    rejected_old += 1
+                    age_hours = (now - pub_date).total_seconds() / 3600
+                    logger.debug(f"Rejecting old article ({age_hours:.1f}h old): {article.get('title', '')[:50]} - Date: {pub_date.isoformat()}")
+            
+            logger.info(f"Date filtering: {len(recent_articles)} recent, {rejected_old} too old, {rejected_no_date} no date")
+            
             # Sort by published date (newest first)
-            # All dates should be timezone-aware now
-            from datetime import timezone
-            all_articles.sort(
-                key=lambda x: x.get("published_date") or datetime.now(timezone.utc),
+            recent_articles.sort(
+                key=lambda x: (x.get("published_date") or x.get("scraped_published_date") or x.get("fetched_at") or datetime.now(timezone.utc)),
                 reverse=True
             )
             
             # Limit to max_articles
-            final_articles = all_articles[:max_articles]
+            final_articles = recent_articles[:max_articles]
             
-            logger.info(f"Fetched {len(final_articles)} unique articles")
+            logger.info(f"Fetched {len(final_articles)} unique recent articles (filtered from {len(all_articles)} total, cutoff: {cutoff_time.isoformat()})")
             return final_articles
             
         except Exception as e:
@@ -613,6 +766,102 @@ class NewsFetcherService:
             return matches
         except Exception as e:
             logger.warning(f"Error fetching Cricbuzz live: {e}")
+            return []
+    
+    async def _fetch_google_custom_search(
+        self,
+        query: str,
+        category: str = "general"
+    ) -> List[Dict[str, Any]]:
+        """Fetch news using Google Custom Search API (primary source for better quality).
+        
+        This uses the Google Custom Search JSON API which provides better, more relevant results
+        compared to RSS feeds.
+        """
+        if not self.google_api_key or not self.google_cx:
+            logger.debug("Google API key or CX not configured - skipping Custom Search API")
+            return []
+        
+        try:
+            # Determine days_back based on category
+            # Sports/Cricket = 1 day (strict), Financial/Stocks = 1 day (need latest rates)
+            # News/Movies/YouTube = 3 days (allow slightly older)
+            cat_l = (category or "").lower()
+            if cat_l in ["sports", "cricket"]:
+                days_back = 1  # Latest sports news only
+            elif cat_l in ["financial", "stocks", "forex", "crypto", "business"]:
+                days_back = 1  # Latest financial data needed
+            else:
+                days_back = 3  # News, Movies, YouTube, etc.
+            
+            # Import Google News Search
+            from services.rag_news.google_search import search_google_news
+            
+            q = (query or "").strip()
+            if not q:
+                q = category or "general"
+            
+            logger.info(f"Google Custom Search API -> query='{q}', category='{category}', days_back={days_back}")
+            
+            # Use Google Custom Search API with date restriction
+            results = await search_google_news(
+                query=q,
+                num_results=10,
+                days_back=days_back,
+                language="en",
+                region="in"  # India region for better local results
+            )
+            
+            # Convert to article format
+            articles = []
+            for item in results:
+                # Try to get published date from item
+                pub_date = None
+                if item.get("published_at"):
+                    try:
+                        pub_date = datetime.fromisoformat(item["published_at"].replace("Z", "+00:00"))
+                    except:
+                        pass
+                
+                if not pub_date:
+                    pub_date = datetime.now(timezone.utc)
+                
+                article = {
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "content": item.get("snippet", ""),
+                    "source": item.get("source", "Google Search"),
+                    "category": category,
+                    "published_date": pub_date,
+                    "fetched_at": datetime.now(timezone.utc),
+                    "image": item.get("image_url", "") or "",
+                    "image_url": item.get("image_url", "") or "",
+                }
+                
+                # Try to scrape actual published date and image from article page
+                if article["url"]:
+                    try:
+                        scraped_dt = await self._scrape_article_date(article["url"])
+                        if scraped_dt:
+                            article["scraped_published_date"] = scraped_dt
+                            article["published_date"] = scraped_dt
+                    except:
+                        pass
+                    
+                    if not article.get("image"):
+                        try:
+                            article["image"] = await self._scrape_article_image(article["url"]) or ""
+                            article["image_url"] = article["image"]
+                        except:
+                            pass
+                
+                articles.append(article)
+            
+            logger.info(f"Google Custom Search API -> Found {len(articles)} articles")
+            return articles
+            
+        except Exception as e:
+            logger.warning(f"Error fetching from Google Custom Search API: {e}")
             return []
     
     async def _fetch_google_news(

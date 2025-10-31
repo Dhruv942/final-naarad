@@ -226,13 +226,31 @@ class PersonalizedNewsPipeline:
                 "processed_at": datetime.utcnow()
             }
             
-            # Store to notification queue
-            if store_to_queue and result["filtered_ranked_articles"]:
-                await self.store_to_notification_queue(final_result)
+            # Send directly via WhatsApp (no queue)
+            # Queue removed per user requirement - need proper direct messages
+            if result["filtered_ranked_articles"]:
+                try:
+                    from controllers.send_controller import send_wati_notification
+                    user_id = final_result.get("user_id")
+                    if user_id:
+                        # Send WhatsApp notification directly for each article
+                        for article in result["filtered_ranked_articles"]:
+                            alert_payload = {
+                                "alert_id": alert_id,
+                                "alert_category": alert_data.get("main_category", ""),
+                                "alert_keywords": alert_data.get("sub_categories", []),
+                                "total_articles": 1,
+                                "articles": [article]
+                            }
+                            wati_response = await send_wati_notification(user_id, alert_payload)
+                            logger.info(f"📱 WhatsApp sent directly to {user_id}: {wati_response.get('status')}")
+                            await asyncio.sleep(0.5)  # Small delay between messages
+                except Exception as e:
+                    logger.error(f"Error sending WhatsApp directly: {str(e)}", exc_info=True)
             
             logger.info(
                 f"✅ Pipeline Complete for {alert_id}: "
-                f"{len(result['filtered_ranked_articles'])} articles ready"
+                f"{len(result['filtered_ranked_articles'])} articles sent directly"
             )
             
             return final_result
@@ -330,7 +348,7 @@ class PersonalizedNewsPipeline:
                                     logger.info(f"WhatsApp sent to {uid}: {wati_response.get('status')}")
                                     await asyncio.sleep(0.5)  # Small delay between messages
                             except Exception as e:
-                                logger.error(f"Error sending WhatsApp to {uid}: {str(e)}")
+                                logger.error(f"Error sending WhatsApp to {uid}: {str(e)}", exc_info=True)
                         
                         # Small delay between a user's alerts to avoid rate limiting
                         await asyncio.sleep(1)

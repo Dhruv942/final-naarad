@@ -11,7 +11,6 @@ import logging
 import os
 
 from core.personalized_news_pipeline import PersonalizedNewsPipeline
-from schedulers.news_pipeline_scheduler import run_pipeline_manually
 from db.mongo import db, alertsparse_collection, notification_queue_collection
 
 logger = logging.getLogger(__name__)
@@ -73,10 +72,10 @@ async def process_single_alert(alert: AlertRequest):
         # Convert request to dict
         alert_data = alert.dict()
         
-        # Run full pipeline
+        # Run full pipeline (sends WhatsApp directly, no queue)
         result = await pipeline.process_alert_full_pipeline(
             alert_data=alert_data,
-            store_to_queue=True
+            store_to_queue=False  # Changed to False - sends directly via WhatsApp
         )
         
         return {
@@ -101,8 +100,9 @@ async def run_batch_processing(background_tasks: BackgroundTasks):
     try:
         logger.info("Manual batch processing triggered")
         
-        # Run in background
-        background_tasks.add_task(run_pipeline_manually)
+        # Run batch processing in background without cron scheduler
+        pipeline = get_pipeline()
+        background_tasks.add_task(pipeline.process_all_active_alerts)
         
         return {
             "success": True,
